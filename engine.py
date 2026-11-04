@@ -63,7 +63,8 @@ class Engine:
             self._unlock_err = time.time()
         if alert and getattr(self, "push", None) and "风险分" not in msg:  # 风险分每天都会报，不推送
             urgent = any(k in msg for k in ("止损", "失败", "⚠", "断开", "离场", "撤"))
-            self.push.send("美股盯盘", msg, priority=4 if urgent else 3)
+            # 优先级 4 以上手机才会弹窗；止损、失败、断线这类紧急的用最高优先级 5（振动更长）
+            self.push.send("美股盯盘", msg, priority=5 if urgent else 4)
         with self.lock:
             self.logs.insert(0, line)
             del self.logs[200:]
@@ -687,7 +688,7 @@ class Engine:
 
     def push_test(self):
         self.push.send("美股盯盘", f"测试推送 ✓ 能收到这条，就说明手机推送设置好了（{datetime.now():%H:%M:%S}）",
-                       priority=3, force=True)
+                       priority=4, force=True)
 
     # ---------- 自动保护：在 moomoo App 里买的股票也自动挂止损 + 止盈 ----------
     def _once(self, code, kind, msg, alert=True):
