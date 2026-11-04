@@ -1,4 +1,6 @@
 """交易规则：一键挂单时程序严格按这里的规则给每只持仓生成动作，不做规则以外的事。"""
+import math
+
 import orders
 import risk
 
@@ -15,6 +17,8 @@ def rules_text(params=None):
         "价格已经跌破动态止损（做空为涨破）或已到止盈的持仓：不再挂保护单，按规则立即限价离场",
         "风险分 ≥ 70 但价格没破动态止损：照常挂保护单；是否提前离场由你勾选（默认不勾）",
         "所有单只在美股常规交易时段触发；数量不超过可卖数量",
+        "碎股：整数部分照常挂服务器止损单；不足 1 股的部分 moomoo 不支持止损单，由程序盯价，"
+        "常规时段跌破止损就限价卖出（这部分需要程序和 OpenD 开着）",
         "现金账户 T+1：当天买入的股票当天不止盈卖出（防止用未交收资金买的股票当天卖出而违规），止损照常有效",
     ]
 
@@ -30,7 +34,8 @@ def buy_rules_text(buy_cfg, params=None):
         f"止损先定好再买：止损价 = 买入价 − {p['loss_cap']:g} ATR；止盈 = 买入价 + {p['target']:g} ATR（和持仓同一套规则）",
         f"股数 = 以下三者取最小：打到止损最多亏总资产 {buy_cfg['risk_pct']:g}%；"
         f"这只股票市值不超过总资产 {buy_cfg['max_pos_pct']:g}%（含已持有部分）；不超过购买力",
-        "算出来不足 1 股就不买，并告诉你差多少",
+        ("支持碎股：股数精确到 0.0001 股，金额至少 $1；碎股部分由程序盯价止损（需要程序和 OpenD 开着）"
+         if buy_cfg.get("fractional", True) else "只买整股：算出来不足 1 股就不买，并告诉你差多少"),
         "同一只股票已有未成交的买单时不重复下单",
         "成交后自动挂上动态止损单并交给自动规则管理（自动上调、自动撤单）",
     ]
@@ -66,26 +71,32 @@ def buy_plan(code, quote, rows, acct, held_qty, buy_cfg, params=None, pending_co
     if not total:
         out["reasons"].append("读不到账户总资产（OpenD 是否已连接？）")
 
-    by_risk = int(total * buy_cfg["risk_pct"] / 100 // per_share) if per_share > 0 else 0
-    by_pos = int(max(0.0, total * buy_cfg["max_pos_pct"] / 100 - held_qty * price) // limit)
-    by_cash = int(power * 0.99 // limit)
+    frac = buy_cfg.get("fractional", True)
+    unit = (lambda x: math.floor(max(0.0, x) * 10000) / 10000) if frac else (lambda x: int(max(0.0, x)))
+    by_risk = unit(total * buy_cfg["risk_pct"] / 100 / per_share) if per_share > 0 else 0
+    by_pos = unit((total * buy_cfg["max_pos_pct"] / 100 - held_qty * price) / limit)
+    by_cash = unit(power * 0.99 / limit)
     qty = max(0, min(by_risk, by_pos, by_cash))
-    out["checks"] += [(f"按风险最多 {by_risk} 股（亏损上限 ${total * buy_cfg['risk_pct'] / 100:,.2f}，"
-                       f"每股风险 ${per_share:.2f}）", by_risk >= 1),
-                      (f"按仓位上限最多 {by_pos} 股（{buy_cfg['max_pos_pct']:g}% 总资产，已持有 {held_qty:g} 股）",
-                       by_pos >= 1),
-                      (f"按购买力最多 {by_cash} 股（购买力 ${power:,.2f}）", by_cash >= 1)]
-    if total and qty < 1:
+    least = orders.MIN_FRAC_USD / limit if frac else 1  # 最少能买多少股
+    out["checks"] += [(f"按风险最多 {by_risk:g} 股（亏损上限 ${total * buy_cfg['risk_pct'] / 100:,.2f}，"
+                       f"每股风险 ${per_share:.2f}）", by_risk >= least),
+                      (f"按仓位上限最多 {by_pos:g} 股（{buy_cfg['max_pos_pct']:g}% 总资产，已持有 {held_qty:g} 股）",
+                       by_pos >= least),
+                      (f"按购买力最多 {by_cash:g} 股（购买力 ${power:,.2f}）", by_cash >= least)]
+    if total and qty < least:
         need = []
-        if by_risk < 1:
-            need.append(f"风险预算不够：买 1 股要总资产至少 ${per_share / (buy_cfg['risk_pct'] / 100):,.0f}")
-        if by_pos < 1:
+        what = f"${orders.MIN_FRAC_USD:g} 的碎股" if frac else "1 股"
+        if by_risk < least:
+            need.append(f"风险预算不够买 {what}：每股风险 ${per_share:.2f}，亏损上限只有 "
+                        f"${total * buy_cfg['risk_pct'] / 100:,.2f}")
+        if by_pos < least:
             room = max(0.0, total * buy_cfg["max_pos_pct"] / 100 - held_qty * price)
-            need.append(f"仓位上限只剩 ${room:,.2f}，不够 1 股" if held_qty == 0 else
+            need.append(f"仓位上限只剩 ${room:,.2f}，不够 {what}" if held_qty == 0 else
                         f"已持有 {held_qty:g} 股，仓位已到上限")
-        if by_cash < 1:
-            need.append(f"购买力不够：1 股需要 ${limit:,.2f}")
-        out["reasons"].append("算出来不足 1 股：" + "；".join(need))
+        if by_cash < least:
+            need.append(f"购买力 ${power:,.2f} 不够 {what}")
+        out["reasons"].append(f"算出来不够 {what}：" + "；".join(need))
+        qty = 0
     out.update(price=price, limit=limit, stop=stop, target=target, atr=a, qty=qty, per_share=per_share,
                cost=qty * limit, max_loss=qty * per_share, max_loss_pct=qty * per_share / total * 100 if total else None)
     out["ok"] = not out["reasons"]

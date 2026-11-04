@@ -160,6 +160,7 @@ async function protect(){const pl=await api("/api/protect/plan");
 
 function vBuy(){const b=S.settings.buy;
   $("view").innerHTML=`<div class="bar">买入代码 <input id="bcode" placeholder="如 MCD" size="10" value="${esc(sel.b||"")}"> <button class="acc" onclick="buyPlanGo()">按规则计算</button>
+   <label class="sub"><input type="checkbox" ${S.settings.buy.fractional!==false?"checked":""} onchange="setOpt('fractional',this.checked).then(()=>{buyPlan=null;render(true)})"> 允许碎股</label>
    <span class="sub" style="margin-left:12px">单笔最多亏总资产 <input id="rp" value="${b.risk_pct}" size="3">% · 单只最多占总资产 <input id="mp" value="${b.max_pos_pct}" size="3">%</span>
    <button onclick="setOpt('risk_pct',$('rp').value).then(()=>setOpt('max_pos_pct',$('mp').value)).then(()=>toast('已保存'))">保存</button></div>
   <div id="bplan"></div>
@@ -176,10 +177,10 @@ function showBuy(p){const el=$("bplan");if(!el)return;
   <ul>${p.checks.map(([t,ok])=>`<li class="${ok?"up":"down"}">${ok?"✓":"✗"} ${esc(t)}</li>`).join("")}</ul>
   ${p.reasons.length?`<p class="down">${p.reasons.map(esc).join("<br>")}</p>`:""}
   ${p.ok?`<p>规则上限 <b>${p.qty}</b> 股 · 约 ${money(p.cost)} · 打到止损最多亏 ${money(p.max_loss)}（${n(p.max_loss_pct)}% 总资产）</p>
-   <p>买入股数 <input id="bq" value="${p.qty}" size="4"> <span class="sub">（只能少于或等于规则上限）</span></p><p class="sub">→ ${esc(p.order)}</p>
+   <p>买入股数 <input id="bq" value="${p.qty}" size="8"> <span class="sub">（只能少于或等于规则上限${S.settings.buy.fractional!==false?"，可以填小数买碎股":""}）</span></p><p class="sub">→ ${esc(p.order)}</p>
    <button class="acc" onclick="buyGo('${esc(p.code)}',${p.qty})">按规则买入</button>`:""}
   <details><summary class="sub">买入规则</summary><ol>${p.rules.map(r=>`<li>${esc(r)}</li>`).join("")}</ol></details></div>`}
-async function buyGo(code,max){const q=parseInt($("bq").value);if(!(q>=1&&q<=max))return toast("股数要在 1~"+max+" 之间");
+async function buyGo(code,max){const q=parseFloat($("bq").value);if(!(q>0&&q<=max))return toast("股数要大于 0、不超过 "+max);
   if(!confirm(`在真实账户买入 ${code} ${q} 股（限价单，当日有效）？\n成交后会自动挂动态止损。\n\n需要先在 OpenD 里解锁交易。`))return;
   const btn=event&&event.target;if(btn)btn.disabled=true;
   try{const r=await act("/api/buy/execute",{code,qty:q,confirm:true});toast(r.result);buyPlan=null;render(true)}finally{if(btn)btn.disabled=false}}

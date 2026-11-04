@@ -174,6 +174,23 @@ class Engine:
             return set()
         return {p["code"] for p in self.positions if p.get("today_buy", 0) > 0}
 
+    def _protect(self, stop_spec, target_spec):
+        """建立保护：整数股照常挂服务器止损单；不足 1 股的碎股部分由程序盯价。返回说明列表。"""
+        q = float(stop_spec["qty"])
+        whole, frac = int(q), round(q - int(q), 6)
+        notes = []
+        with self.lock:
+            if whole >= 1:
+                _, n = self.bm.create({**stop_spec, "qty": whole}, target_spec and {**target_spec, "qty": whole},
+                                      "REAL", server_target=not self._cash())
+                notes += n
+            if frac > 0:
+                _, n = self.bm.create_local({**stop_spec, "qty": frac}, target_spec and {**target_spec, "qty": frac},
+                                            "REAL")
+                notes += n
+            save(self.cfg)
+        return notes
+
     def active_rule_codes(self):
         return {"us" + b["code"].split(".", 1)[1] for b in self.cfg["brackets"]
                 if b["status"] == "active" and b["env"] == "REAL"}
@@ -269,6 +286,8 @@ class Engine:
                 self.cfg["mode"] = value
             elif key in ("auto_screen", "auto_protect"):
                 self.cfg[key] = bool(value)
+            elif key == "fractional":
+                self.cfg["buy"]["fractional"] = bool(value)
             elif key == "push_enabled":
                 self.cfg["push"]["enabled"] = bool(value)
             elif key in ("risk_pct", "max_pos_pct"):
@@ -493,10 +512,7 @@ class Engine:
                     results.append(f"✓ {it['name']} 规则离场单已提交，订单号 {oid}")
                     self.log(f"一键：规则离场 {orders.describe(s, 'REAL')} 订单号 {oid}", order=True)
                 else:
-                    with self.lock:
-                        _, notes = self.bm.create(it["specs"][0], it["specs"][1] if len(it["specs"]) > 1 else None,
-                                                  "REAL", server_target=not self._cash())
-                        save(self.cfg)
+                    notes = self._protect(it["specs"][0], it["specs"][1] if len(it["specs"]) > 1 else None)
                     results.append(f"✓ {it['name']}：" + "；".join(notes))
             except Exception as e:
                 results.append(f"✗ {it['name']}：{self._explain(e)}")
@@ -544,9 +560,9 @@ class Engine:
         plan = self.buy_plan(code)
         if not plan["ok"]:
             raise ValueError("按规则不能买：" + "；".join(plan["reasons"]))
-        qty = int(qty)
-        if not 1 <= qty <= plan["qty"]:
-            raise ValueError(f"股数必须在 1 ~ {plan['qty']} 之间（规则上限）")
+        qty = round(float(qty), 4)
+        if not 0 < qty <= plan["qty"] or (not self.cfg.get("buy", {}).get("fractional", True) and not qty.is_integer()):
+            raise ValueError(f"股数必须大于 0、不超过 {plan['qty']:g}（规则上限）")
         spec, err = orders.build_buy(plan["code"], plan["limit"], qty)
         if err:
             raise ValueError(err)
@@ -615,9 +631,7 @@ class Engine:
         tgt = None
         if r.get("take_profit"):
             tgt, _ = orders.build(pos, q.get("price", avg), "target", round(r["take_profit"], 2), filled)
-        with self.lock:
-            _, notes = self.bm.create(spec, tgt, "REAL", server_target=not self._cash())
-            save(self.cfg)
+        self._protect(spec, tgt)
         self.log(f"{b['name']} 买入成交 {filled:g} 股 @ {avg:.2f}，已自动挂动态止损 {r['trail_stop']:.2f}"
                  + (f"、止盈 {r['take_profit']:.2f}" if r.get("take_profit") else ""), alert=True)
 
@@ -658,7 +672,7 @@ class Engine:
                 continue
             c = "us" + b["code"].split(".", 1)[1]
             covered[c] = covered.get(c, 0) + b["qty"]
-            if self.link.trd and b["stop_id"] not in live:
+            if self.link.trd and not b.get("stop_local") and b["stop_id"] not in live:
                 problems.append(f"{b['code']} 的止损单 {b['stop_id']} 在 moomoo 上找不到了（可能被撤或过期）")
         for p in self.positions:
             gap = p["qty"] - covered.get(p["code"], 0)
@@ -710,7 +724,7 @@ class Engine:
             if b["status"] == "active" and b["env"] == "REAL":
                 c = "us" + b["code"].split(".", 1)[1]
                 covered[c] = covered.get(c, 0) + b["qty"]
-        need_by = {p["code"]: p["qty"] - covered.get(p["code"], 0) for p in self.positions}
+        need_by = {p["code"]: round(p["qty"] - covered.get(p["code"], 0), 6) for p in self.positions}
         created = False
         for c in [c for c in self._unprot if need_by.get(c, 0) <= 0]:
             self._unprot.pop(c, None)
@@ -720,7 +734,7 @@ class Engine:
                 continue
             if now - self._unprot.setdefault(c, now) < AUTO_PROTECT_WAIT or c not in self.reports:
                 continue
-            pc = {**p, "qty": int(need) if float(need).is_integer() else need}
+            pc = {**p, "qty": int(need) if float(need).is_integer() else round(need, 6)}
             it = rules.plan([pc], self.reports, set(), self.t1_hold())[0]
             if it["action"] == "exit":
                 self._once(c, "exit", f"⚠ {p['name']} 有 {need:g} 股没有保护，而且{it['why']}：没有自动卖出，"
@@ -738,11 +752,8 @@ class Engine:
                                             "（可能你在 moomoo 里已经挂了卖单），没有自动挂", alert=False)
                     self._ap_retry[c] = now + AUTO_PROTECT_RETRY
                     continue
-                with self.lock:
-                    specs = it["specs"]
-                    _, notes = self.bm.create(specs[0], specs[1] if len(specs) > 1 else None, "REAL",
-                                              server_target=not self._cash())
-                    save(self.cfg)
+                specs = it["specs"]
+                self._protect(specs[0], specs[1] if len(specs) > 1 else None)
                 self._unprot.pop(c, None)
                 created = True
                 self.log(f"自动保护：{p['name']} {need:g} 股不在规则里，已按规则挂上保护（{it['why']}）", order=True,
