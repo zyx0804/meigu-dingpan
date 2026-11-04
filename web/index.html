@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>美股盯盘</title>
+<style>
+:root{--bg:#121316;--panel:#1b1c21;--panel2:#24262c;--stripe:#1f2026;--border:#2e3038;--text:#e8e9ec;--sub:#8b8e97;
+--accent:#ff6a00;--up:#22c38e;--down:#f2495c;--warn:#f0a24a;--sel:#2c3a52;--hi:#3d1d24;--mid:#3a3219}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 "Microsoft YaHei UI","PingFang SC",system-ui,sans-serif}
+header{display:flex;align-items:center;gap:10px;padding:12px 18px;flex-wrap:wrap}
+h1{margin:0 14px 0 0;font-size:20px;color:var(--accent)}
+input,select{background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:7px 10px;font:inherit}
+button{background:var(--panel2);color:var(--text);border:0;border-radius:6px;padding:7px 14px;font:inherit;cursor:pointer}
+button:hover{background:var(--border)} button.acc{background:var(--accent);color:#fff;font-weight:bold} button.acc:hover{background:#ff8533}
+button:disabled{opacity:.5;cursor:default}
+.dot{margin-left:auto;font-size:13px} .ok{color:var(--up)} .bad{color:var(--down)}
+nav{display:flex;gap:4px;padding:0 18px;border-bottom:1px solid var(--border)}
+nav a{padding:9px 18px;color:var(--sub);cursor:pointer;border-top:2px solid transparent;border-radius:6px 6px 0 0}
+nav a.on{color:var(--accent);background:var(--panel);border-top-color:var(--accent);font-weight:bold}
+main{padding:12px 18px 90px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:10px}
+.card{background:var(--panel);border-radius:8px;padding:10px 14px}.card small{color:var(--sub);font-size:12px}.card b{display:block;font-size:20px}
+.bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0}
+.sub{color:var(--sub);font-size:12px}
+.tbl{overflow-x:auto;background:var(--panel);border-radius:8px}
+table{width:100%;border-collapse:collapse;white-space:nowrap}
+th{background:var(--panel2);color:var(--sub);font-weight:normal;font-size:12px;padding:8px 10px;text-align:right;position:sticky;top:0}
+td{padding:7px 10px;text-align:right;border-top:1px solid var(--stripe)}
+th:first-child,td:first-child{text-align:left} tr:nth-child(even) td{background:var(--stripe)}
+tr.sel td{background:var(--sel)!important} tr.lv2 td{background:var(--hi)} tr.lv1 td{background:var(--mid)}
+tbody tr{cursor:pointer}
+.up{color:var(--up)} .down{color:var(--down)} .warn{color:var(--warn)} .accent{color:var(--accent)}
+.box{background:var(--panel);border-radius:8px;padding:12px 16px;margin:10px 0}
+.box h3{margin:0 0 6px;color:var(--accent);font-size:15px}
+ol,ul{margin:4px 0;padding-left:20px}
+#log{position:fixed;left:0;right:0;bottom:0;background:var(--panel);border-top:1px solid var(--border);max-height:76px;overflow:auto;
+padding:6px 18px;font-size:12px;color:var(--sub)}
+.modal{position:fixed;inset:0;background:#000a;display:none;align-items:flex-start;justify-content:center;padding:40px 12px;z-index:9;overflow:auto}
+.modal.on{display:flex}.dlg{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:18px 22px;width:min(760px,100%)}
+.dlg h2{margin:0 0 10px;font-size:17px}
+#toasts{position:fixed;right:16px;top:16px;display:flex;flex-direction:column;gap:8px;z-index:10}
+.toast{background:var(--panel2);border-left:4px solid var(--accent);padding:10px 14px;border-radius:6px;max-width:380px;box-shadow:0 4px 16px #0008}
+.banner{background:#2a2216;border:1px solid var(--warn);border-radius:8px;padding:8px 14px;margin:0 18px 8px;display:none}
+.chk{display:block;margin:6px 0}
+</style>
+</head>
+<body>
+<header>
+  <h1>美股盯盘</h1>
+  <input id="code" placeholder="输入代码 如 AAPL" size="14">
+  <button class="acc" onclick="addStock()">＋ 添加</button>
+  <button onclick="act('/api/screen').then(()=>toast('已开始选股，约 10~30 秒'))">立即选股</button>
+  <label class="sub"><input type="checkbox" id="autoscr" onchange="setOpt('auto_screen',this.checked)"> 每日自动选股</label>
+  <span id="conn" class="dot bad">● 未连接</span>
+</header>
+<div id="upd" class="banner"></div>
+<nav id="tabs"></nav>
+<main id="view"></main>
+<div id="log"></div>
+<div id="toasts"></div>
+<div id="modal" class="modal" onclick="if(event.target===this)closeM()"><div class="dlg" id="dlg"></div></div>
+<script>
+const TOKEN="__TOKEN__";
+const TABS=[["watch","自选行情"],["pos","持仓 · 风险"],["buy","买入"],["orders","挂单"],["journal","复盘 · 规则进化"]];
+let tab=localStorage.getItem("tab")||"watch", S=null, sel={}, lastEv=0, buyPlan=null;
+const $=id=>document.getElementById(id);
+const esc=v=>String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const n=(v,d=2)=>v==null||isNaN(v)?"-":Number(v).toFixed(d);
+const sgn=v=>v>0?"up":v<0?"down":"";
+const money=v=>v==null?"-":(v<0?"-":"")+"$"+Math.abs(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+async function api(path,opt={}){const r=await fetch(path,{...opt,headers:{"X-Token":TOKEN,"Content-Type":"application/json"}});
+  const j=await r.json().catch(()=>({error:"服务器无响应"}));if(!r.ok)throw new Error(j.error||r.status);return j}
+const act=(p,b={})=>api(p,{method:"POST",body:JSON.stringify(b)}).catch(e=>{toast("✗ "+e.message);throw e});
+function toast(m){const d=document.createElement("div");d.className="toast";d.textContent=m;$("toasts").appendChild(d);setTimeout(()=>d.remove(),8000)}
+function beep(){try{const c=new AudioContext(),o=c.createOscillator(),g=c.createGain();o.connect(g);g.connect(c.destination);
+  o.frequency.value=880;g.gain.value=.15;o.start();setTimeout(()=>{o.stop();c.close()},250)}catch(e){}}
+function openM(h){$("dlg").innerHTML=h;$("modal").classList.add("on")} function closeM(){$("modal").classList.remove("on")}
+function setTab(t){tab=t;localStorage.setItem("tab",t);render(true)}
+const setOpt=(k,v)=>act("/api/option",{key:k,value:v});
+async function addStock(){const c=$("code").value.trim();if(!c)return;await act("/api/watch/add",{code:c});$("code").value="";toast("已添加")}
+$("code").addEventListener("keydown",e=>{if(e.key==="Enter")addStock()});
+
+async function poll(){try{S=await api("/api/state?since="+lastEv);for(const e of S.events){lastEv=Math.max(lastEv,e.id);toast("🔔 "+e.msg);beep()}
+  render()}catch(e){$("conn").className="dot bad";$("conn").textContent="● 程序没在运行？"}setTimeout(poll,1000)}
+
+function render(force){
+  $("tabs").innerHTML=TABS.map(([k,v])=>`<a class="${k===tab?"on":""}" onclick="setTab('${k}')">${v}</a>`).join("");
+  if(!S)return;
+  $("conn").className="dot "+(S.connected?"ok":"bad");$("conn").textContent="● "+(S.connected?"已连接 moomoo":S.acc_status.split("：")[0]);
+  $("autoscr").checked=S.settings.auto_screen;
+  $("log").innerHTML=`<span class="sub">${esc(S.updated)} · 每秒刷新 · 版本 ${esc(S.version)}</span><br>`+S.logs.map(esc).join("<br>");
+  const u=S.update;if(u&&u.available){$("upd").style.display="block";$("upd").innerHTML=`发现新版本 <b>${esc(u.available)}</b>：${esc(u.notes||"")} <button class="acc" onclick="doUpdate()">立即更新</button>`}else $("upd").style.display="none";
+  if(document.activeElement&&document.activeElement.closest&&document.activeElement.closest("#view")&&!force)return; // 正在输入时不重画
+  ({watch:vWatch,pos:vPos,buy:vBuy,orders:vOrders,journal:vJournal})[tab]();
+}
+async function doUpdate(){const r=await act("/api/update/apply");toast(r.result);setTimeout(()=>location.reload(),9000)}
+
+function rowClick(kind,id){sel[kind]=id;render(true)}
+function vWatch(){
+  const w=S.watch,s=w.find(x=>x.code===sel.w);
+  $("view").innerHTML=`<div class="bar"><button onclick="watchAct('remove')">删除</button><button onclick="watchAct('lock')">锁定/解锁</button>
+  <button onclick="alertDlg()">到价提醒</button><span class="sub">${s?esc(`${s.code}（${s.src}）`)+(s.score!=null?` 评分 ${s.score} · 第 ${s.rank} 名 · ${esc(s.reason)}`:" 还没有评分"):"选中一行看筛选理由。自动选股只看走势和成交数据，不代表推荐。"}</span></div>
+  <div class="tbl"><table><thead><tr><th>名称</th><th>代码</th><th>来源</th><th>评分</th><th>现价($)</th><th>涨跌幅</th><th>涨跌额</th><th>开盘</th><th>最高</th><th>最低</th><th>提醒</th><th>更新时间(美东)</th></tr></thead><tbody>
+  ${w.map(x=>`<tr class="${x.code===sel.w?"sel":""} ${sgn(x.chg)}" onclick="rowClick('w','${esc(x.code)}')"><td>${esc(x.name)}</td><td>${esc(x.code)}</td><td>${esc(x.src)}</td><td>${x.score??""}</td>
+  <td>${n(x.price)}</td><td>${x.pct==null?"-":(x.pct>0?"+":"")+n(x.pct)+"%"}</td><td>${x.chg==null?"-":(x.chg>0?"+":"")+n(x.chg)}</td><td>${n(x.open)}</td><td>${n(x.high)}</td><td>${n(x.low)}</td>
+  <td>${x.alert?esc([x.alert.above&&"≥"+x.alert.above,x.alert.below&&"≤"+x.alert.below,x.alert.pct&&"±"+x.alert.pct+"%"].filter(Boolean).join(" ")):""}</td><td>${esc(x.time)}</td></tr>`).join("")}</tbody></table></div>`;
+}
+async function watchAct(k){if(!sel.w)return toast("先选中一只股票");if(k==="remove"&&!confirm("从自选里删除 "+sel.w+"？"))return;await act("/api/watch/"+k,{code:sel.w})}
+function alertDlg(){if(!sel.w)return toast("先选中一只股票");const a=(S.watch.find(x=>x.code===sel.w)||{}).alert||{};
+  openM(`<h2>到价提醒 · ${esc(sel.w)}</h2><p class="sub">留空 = 不提醒；触发时网页弹出提醒并响一声（网页要开着）</p>
+  <p>价格高于 <input id="a1" value="${a.above??""}" size="8"> 价格低于 <input id="a2" value="${a.below??""}" size="8"> 涨跌幅超过 ± <input id="a3" value="${a.pct??""}" size="5">%</p>
+  <button class="acc" onclick="act('/api/alert',{code:'${esc(sel.w)}',above:$('a1').value,below:$('a2').value,pct:$('a3').value}).then(closeM)">保存</button> <button onclick="closeM()">取消</button>`)}
+
+function vPos(){
+  const a=S.account,P=S.positions,lv={"高":"down","中":"warn","低":"up"};
+  $("view").innerHTML=`<div class="cards">
+   <div class="card"><small>总资产 (USD)</small><b>${a?money(a.total_assets):"--"}</b></div><div class="card"><small>持仓市值</small><b>${a?money(a.mv):"--"}</b></div>
+   <div class="card"><small>现金</small><b>${a?money(a.cash):"--"}</b></div><div class="card"><small>持仓盈亏</small><b class="${a?sgn(a.pl):""}">${a?money(a.pl):"--"}</b></div>
+   <div class="card"><small>账户整体风险</small><b class="${a?lv[a.level]||"":""}">${a?esc(a.level||"-"):"--"}</b></div></div>
+  <div class="bar">持仓周期 <select onchange="setOpt('mode',this.value)">${Object.entries(S.settings.modes).map(([k,v])=>`<option value="${k}" ${k===S.settings.mode?"selected":""}>${esc(v)}</option>`).join("")}</select>
+   <span class="sub">${a?`持仓 ${P.length} 只 · 购买力 ${money(a.power)} · 规则 v${S.settings.rule_params.version}`:esc(S.acc_status)}</span>
+   <span style="margin-left:auto"></span><button onclick="report()">风险报告</button><button class="acc" onclick="protect()">一键挂保护单</button></div>
+  <div class="tbl"><table><thead><tr><th>名称</th><th>代码</th><th>股数</th><th>成本</th><th>现价</th><th>盈亏%</th><th>仓位占比</th><th>日均波动</th><th>风险分</th><th>动态止损</th><th>保护状态</th><th>离场信号</th><th>风险等级</th></tr></thead><tbody>
+  ${P.map(p=>`<tr class="${p.code===sel.p?"sel":""} ${p.signals.length?"lv2":p.level==="高"?"lv2":p.level==="中"?"lv1":""}" onclick="rowClick('p','${esc(p.code)}')"><td>${esc(p.name)}</td><td>${esc(p.code)}</td><td>${p.qty}</td><td>${n(p.cost)}</td><td>${n(p.price)}</td>
+   <td class="${sgn(p.pl_pct)}">${(p.pl_pct>0?"+":"")+n(p.pl_pct)}%</td><td>${n(p.weight,0)}%</td><td>${n(p.atr_pct,1)}%</td><td>${p.risk_score??"-"}</td><td>${n(p.trail_stop)}<span class="sub"> ${esc(p.stage||"")}</span></td>
+   <td class="${p.protected?"up":"warn"}">${p.protected?"已保护":"⚠ 未保护"}</td><td>${esc(p.signals.join("；")||"—")}</td><td class="${lv[p.level]||""}">${esc(p.level||"计算中")}</td></tr>`).join("")||`<tr><td colspan="13" class="sub">${S.connected?"没有美股持仓":"连上 moomoo OpenD 后显示持仓"}</td></tr>`}</tbody></table></div>
+  ${a?`<div class="box"><h3>风险概况</h3>账户：${esc(a.reasons.join("；"))}${P.map(p=>`<br>${esc(p.name)}（风险${esc(p.level||"-")}）：${esc(p.reasons.slice(0,2).join("；"))}`).join("")}</div>`:""}
+  <p class="sub">参考位按波动率计算，不构成投资建议；只有你点确认才会挂单。</p>`;
+}
+function report(){const p=S.positions.find(x=>x.code===sel.p)||S.positions[0];if(!p)return;
+  openM(`<h2>${esc(p.name)}（${esc(p.code)}） 风险等级：${esc(p.level||"-")}</h2><p>${p.qty} 股 · 成本 ${n(p.cost)} · 现价 ${n(p.price)} · 盈亏 <span class="${sgn(p.pl_pct)}">${n(p.pl_pct)}%</span></p>
+  <div class="box"><h3>风险因素</h3><ul>${p.reasons.map(r=>`<li>${esc(r)}</li>`).join("")}</ul></div>
+  <div class="box"><h3>动态止损</h3>当前 ${n(p.trail_stop)}（阶段：${esc(p.stage||"-")}）· 打到止损${p.stop_loss_usd>0?"亏 "+money(p.stop_loss_usd):"仍赚 "+money(-p.stop_loss_usd)} · 最多亏 ${money(p.max_loss)}</div>
+  <div class="box"><h3>如果价格变成…</h3><table><tr><th>情景</th><th>价格</th><th>相对现在</th><th>相对成本</th><th>占总资产</th></tr>${p.scenarios.map(s=>`<tr><td>${esc(s.label)}</td><td>${n(s.price)}</td><td class="${sgn(s.pnl_now)}">${money(s.pnl_now)}</td><td class="${sgn(s.pnl_cost)}">${money(s.pnl_cost)}</td><td>${n(s.pct_assets,1)}%</td></tr>`).join("")}</table></div>
+  <button onclick="closeM()">关闭</button>`)}
+async function protect(){const pl=await api("/api/protect/plan");
+  openM(`<h2>一键挂保护单（真实账户）</h2><div class="box"><h3>交易规则 v${pl.version}</h3><ol>${pl.rules.map(r=>`<li>${esc(r)}</li>`).join("")}</ol></div>
+  <div class="box"><h3>本次计划</h3>${pl.items.map((it,i)=>`<label class="chk"><input type="checkbox" id="pk${i}" ${it.action!=="skip"&&!it.error?"checked":"disabled"}> <b>${esc(it.name)} ${it.qty} 股 · ${({protect:"挂保护单",exit:"规则离场",skip:"跳过"})[it.action]}</b><br><span class="sub">${esc(it.why)}</span>
+   ${it.orders.map(o=>`<br><span class="sub">→ ${esc(o)}</span>`).join("")}</label>${it.optional_exit?`<label class="chk" style="margin-left:22px"><input type="checkbox" id="ex${i}"> 改为按风险分提前离场（立即限价卖出，不挂保护单）</label>`:""}`).join("")||"没有持仓"}</div>
+  <p class="warn">需要先在 OpenD 窗口里「解锁交易」。确认后按规则自动执行（自动上调止损、自动撤单需要程序和 OpenD 开着）。</p>
+  <button class="acc" id="go">一键执行</button> <button onclick="closeM()">取消</button>`);
+  $("go").onclick=async()=>{const picks=pl.items.map((it,i)=>({code:it.code,on:$("pk"+i)&&$("pk"+i).checked,early:$("ex"+i)&&$("ex"+i).checked})).filter(x=>x.on);
+   if(!picks.length)return toast("没有要执行的项目");if(!confirm("将在真实账户执行所选项目，触发后会真的成交。确定吗？"))return;
+   $("go").disabled=true;const r=await act("/api/protect/execute",{picks,confirm:true});openM(`<h2>执行结果</h2>${r.results.map(x=>`<p>${esc(x)}</p>`).join("")}<button onclick="closeM()">关闭</button>`)}}
+
+function vBuy(){const b=S.settings.buy;
+  $("view").innerHTML=`<div class="bar">买入代码 <input id="bcode" placeholder="如 MCD" size="10" value="${esc(sel.b||"")}"> <button class="acc" onclick="buyPlanGo()">按规则计算</button>
+   <span class="sub" style="margin-left:12px">单笔最多亏总资产 <input id="rp" value="${b.risk_pct}" size="3">% · 单只最多占总资产 <input id="mp" value="${b.max_pos_pct}" size="3">%</span>
+   <button onclick="setOpt('risk_pct',$('rp').value).then(()=>setOpt('max_pos_pct',$('mp').value)).then(()=>toast('已保存'))">保存</button></div>
+  <div id="bplan"></div>
+  <div class="box"><h3>候选：今日选股里符合趋势条件的</h3><div class="tbl"><table><thead><tr><th>名称</th><th>代码</th><th>评分</th><th>现价</th><th>涨跌幅</th><th>理由</th></tr></thead><tbody>
+  ${S.watch.filter(x=>x.score!=null&&x.src!=="指数").sort((a,b)=>b.score-a.score).map(x=>`<tr onclick="sel.b='${esc(x.code)}';$('bcode').value='${esc(x.code)}';buyPlanGo()"><td>${esc(x.name)}</td><td>${esc(x.code)}</td><td>${x.score}</td><td>${n(x.price)}</td><td class="${sgn(x.pct)}">${n(x.pct)}%</td><td class="sub" style="text-align:left">${esc(x.reason)}</td></tr>`).join("")}</tbody></table></div>
+  <p class="sub">点一行就按规则计算。选股只看走势和成交数据，不代表推荐；买不买由你决定。</p></div>
+  ${S.pending_buys.length?`<div class="box"><h3>等待成交的买单</h3>${S.pending_buys.map(p=>`<p>${esc(p.name)} ${p.qty} 股 限价 ${p.limit} · 订单 ${esc(p.order_id)} · ${esc(p.created)}（成交后自动挂动态止损）</p>`).join("")}</div>`:""}`;
+  if(buyPlan)showBuy(buyPlan)}
+async function buyPlanGo(){const c=$("bcode").value.trim();if(!c)return;sel.b=c;$("bplan").innerHTML="<p class='sub'>计算中…</p>";
+  try{buyPlan=await api("/api/buy/plan?code="+encodeURIComponent(c));showBuy(buyPlan)}catch(e){$("bplan").innerHTML=`<p class="down">${esc(e.message)}</p>`}}
+function showBuy(p){const el=$("bplan");if(!el)return;
+  el.innerHTML=`<div class="box"><h3>${esc(p.name)}（${esc(p.code)}） ${p.ok?'<span class="up">✓ 符合买入规则</span>':'<span class="down">✗ 不符合买入规则</span>'}</h3>
+  ${p.price?`<p>现价 ${n(p.price)} · 限价 <b>${n(p.limit)}</b> · 止损 <b>${n(p.stop)}</b>（${n(p.atr)} ATR）· 每股风险 ${money(p.per_share)}</p>`:""}
+  <ul>${p.checks.map(([t,ok])=>`<li class="${ok?"up":"down"}">${ok?"✓":"✗"} ${esc(t)}</li>`).join("")}</ul>
+  ${p.reasons.length?`<p class="down">${p.reasons.map(esc).join("<br>")}</p>`:""}
+  ${p.ok?`<p>规则上限 <b>${p.qty}</b> 股 · 约 ${money(p.cost)} · 打到止损最多亏 ${money(p.max_loss)}（${n(p.max_loss_pct)}% 总资产）</p>
+   <p>买入股数 <input id="bq" value="${p.qty}" size="4"> <span class="sub">（只能少于或等于规则上限）</span></p><p class="sub">→ ${esc(p.order)}</p>
+   <button class="acc" onclick="buyGo('${esc(p.code)}',${p.qty})">按规则买入</button>`:""}
+  <details><summary class="sub">买入规则</summary><ol>${p.rules.map(r=>`<li>${esc(r)}</li>`).join("")}</ol></details></div>`}
+async function buyGo(code,max){const q=parseInt($("bq").value);if(!(q>=1&&q<=max))return toast("股数要在 1~"+max+" 之间");
+  if(!confirm(`在真实账户买入 ${code} ${q} 股（限价单，当日有效）？\n成交后会自动挂动态止损。\n\n需要先在 OpenD 里解锁交易。`))return;
+  const r=await act("/api/buy/execute",{code,qty:q,confirm:true});toast(r.result);buyPlan=null;render(true)}
+
+function vOrders(){
+  $("view").innerHTML=`<div class="bar"><button onclick="cancelSel()">撤销选中</button><button onclick="cancelAll()">全部撤销</button><span class="sub">每 5 秒自动刷新 ${esc(S.order_note)}</span></div>
+  <div class="tbl"><table><thead><tr><th>账户</th><th>代码</th><th>名称</th><th>方向</th><th>类型</th><th>数量</th><th>价格</th><th>触发价</th><th>有效期</th><th>状态</th><th>下单时间</th></tr></thead><tbody>
+  ${S.orders.map(o=>{const id=o.env+"|"+o.order_id;return `<tr class="${id===sel.o?"sel":""}" onclick="rowClick('o','${esc(id)}')"><td>${esc(o.env_name)}</td><td>${esc(o.code)}</td><td>${esc(o.name)}</td><td>${esc(o.side)}</td><td>${esc(o.type)}</td><td>${o.qty}</td><td>${o.price}</td><td>${esc(o.aux)}</td><td>${esc(o.tif)}</td><td>${esc(o.status)}</td><td>${esc(o.time)}</td></tr>`}).join("")||'<tr><td colspan="11" class="sub">没有未成交挂单</td></tr>'}</tbody></table></div>
+  <div class="bar" style="margin-top:14px"><b>自动规则</b><span class="sub">止损单跟着动态止损自动上调；一边成交自动撤另一边；持仓没了自动撤单</span><button style="margin-left:auto" onclick="stopRule()">停止选中规则</button></div>
+  <div class="tbl"><table><thead><tr><th>规则</th><th>账户</th><th>代码</th><th>数量</th><th>止损单</th><th>止盈价</th><th>状态</th><th>建立时间</th></tr></thead><tbody>
+  ${S.rules.map(r=>`<tr class="${r.id===sel.r?"sel":""}" onclick="rowClick('r','${esc(r.id)}')"><td>${esc(r.id)}</td><td>${esc(r.env)}</td><td>${esc(r.code)}</td><td>${r.qty}</td><td>${esc(r.stop)} · #${esc(r.stop_id)}${r.ratchets?` · 已上调 ${r.ratchets} 次`:""}</td><td>${r.target??"—"}</td><td class="${r.active?"up":"sub"}">${esc(r.status)}</td><td>${esc(r.created)}</td></tr>`).join("")||'<tr><td colspan="8" class="sub">还没有规则</td></tr>'}</tbody></table></div>`}
+async function cancelSel(){if(!sel.o)return toast("先选中一张挂单");const[env,id]=sel.o.split("|");if(!confirm("撤销这张挂单？撤掉止损单后对应持仓就没有保护了。"))return;await act("/api/order/cancel",{env,order_id:id});toast("已撤单")}
+async function cancelAll(){if(!S.orders.length)return toast("没有挂单");if(!confirm(`撤销全部 ${S.orders.length} 张挂单，并停止所有自动规则？`))return;const r=await act("/api/order/cancel_all");toast(r.fails.length?"部分失败："+r.fails.join("；"):"已全部撤销")}
+async function stopRule(){const r=S.rules.find(x=>x.id===sel.r);if(!r||!r.active)return toast("先选中一条运行中的规则");if(!confirm("停止规则 "+r.id+" 并撤销它的挂单？"))return;await act("/api/rule/stop",{id:r.id});toast("已停止")}
+
+let J=null,jT=0;
+async function vJournal(){if(!J||Date.now()-jT>15000){J=await api("/api/journal");jT=Date.now()}
+  const j=J.journal||{},st=j.stats,rp=J.rule_params,sug=J.suggestion,b=j.base,bt=J.bt||{};
+  $("view").innerHTML=`<div class="box"><h3>当前规则 v${rp.version}${rp.since?"（"+esc(rp.since)+" 起）":""}</h3>相对成本最多亏 ${rp.loss_cap} ATR · 买入后最高点回撤 ${rp.trail} ATR 跟踪 · 浮盈 ${rp.breakeven} ATR 后保本
+   ${J.rule_history.slice().reverse().map(h=>`<br><span class="sub">历史 v${h.version}：限亏 ${h.loss_cap} / 跟踪 ${h.trail} / 保本 ${h.breakeven}（用到 ${esc(h.until)}）</span>`).join("")}
+   <div class="bar">${sug?`<button class="acc" onclick="if(confirm('采用新规则？已挂的止损只会按新规则往上调，不会被放宽。'))act('/api/rule/adopt').then(()=>{J=null;render(true)})">采用新规则</button>`:""}
+   ${J.rule_history.length?`<button onclick="if(confirm('退回上一版？'))act('/api/rule/rollback').then(()=>{J=null;render(true)})">退回上一版</button>`:""}
+   <button onclick="act('/api/backtest').then(()=>{toast('已开始分析，约 30~60 秒');J=null})" ${S.backtesting?"disabled":""}>${S.backtesting?"分析中…":"立即分析"}</button></div></div>
+  <div class="box"><h3>你的交易 ${j.date?"（"+esc(j.date)+"，共 "+j.deals+" 条成交）":""}</h3>
+   ${st?`已平仓 ${st.n} 笔 · 胜率 ${n(st.win,0)}% · 累计 <span class="${sgn(st.pnl)}">${money(st.pnl)}</span> · 平均盈利 ${n(st.avg_win,1)}% · 平均亏损 ${n(st.avg_loss,1)}% · 最差一笔 ${n(st.worst,1)}%
+   ${(j.trades||[]).slice(-10).map(t=>`<br><span class="${sgn(t.pnl)}">${esc(t.entry_time.slice(0,10))} → ${esc(t.exit_time.slice(0,10))} ${esc(t.name)} ${t.qty} 股 ${n(t.entry)} → ${n(t.exit)} ${n(t.ret*100,1)}%（${esc(t.how||"手动")}）</span>`).join("")}`:"还没有已平仓的交易"}
+   ${Object.values(j.open||{}).flat().map(l=>`<br>持仓中：${esc(l.name)} ${l.qty} 股，${esc(l.time.slice(0,10))} 以 ${n(l.price)} 买入`).join("")}</div>
+  <div class="box"><h3>复盘发现</h3><ul>${(j.insights||["还没有复盘数据，点「立即分析」"]).map(x=>`<li>${esc(x)}</li>`).join("")}</ul></div>
+  <div class="box"><h3>规则进化</h3>${b?`评估样本：候选池回测 ${b.trades} 笔 + 你的真实买入 ${j.entries} 次；你的交易权重 ${n(j.weight*100,0)}%（已平仓 20 笔后为 100%）
+   <br>当前规则：平均每笔 ${n(b.avg)}% · 最差一笔 ${n(b.worst,1)}% · 最大回撤 ${n(b.mdd,1)}%${b.user_avg!=null?` · 按你的买入复盘 ${n(b.user_avg)}%`:""}
+   ${sug?`<br><span class="up">建议：限亏 ${sug.params.loss_cap} / 跟踪 ${sug.params.trail} / 保本 ${sug.params.breakeven} ATR → 平均每笔 ${n(sug.avg)}% · 最差一笔 ${n(sug.worst,1)}% · 最大回撤 ${n(sug.mdd,1)}%</span><br><span class="sub">已通过护栏：收益更高、最差一笔不更差、回撤不更高、前后两段分开测都不更差</span>`:"<br>目前没有在所有护栏下都更好的参数"}`:"还没有分析结果"}</div>
+  ${bt.results?`<div class="box"><h3>离场规则回测（${esc(bt.date)}，${bt.stocks} 只股票、近 2 年）</h3><div class="tbl"><table><tr><th>规则</th><th>笔数</th><th>胜率</th><th>平均每笔</th><th>累计</th><th>最大回撤</th><th>最差一笔</th></tr>
+   ${bt.results.map(r=>`<tr><td>${esc(r.name)}</td><td>${r.trades}</td><td>${n(r.win,0)}%</td><td class="${sgn(r.avg)}">${n(r.avg)}%</td><td>${n(r.total,1)}%</td><td>${n(r.mdd,1)}%</td><td>${n(r.worst,1)}%</td></tr>`).join("")}</table></div><p class="sub">历史表现不代表未来。</p></div>`:""}`}
+render();poll();
+</script>
+</body>
+</html>

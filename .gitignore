@@ -1,0 +1,6 @@
+# 个人数据：账户、规则、订单、交易记录，永远不上传
+stocks.json
+data/
+backup/
+__pycache__/
+*.pyc
