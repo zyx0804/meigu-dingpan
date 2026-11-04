@@ -1,8 +1,11 @@
 """桌面版和网页版共用的配置读写、代码格式和行情获取。"""
 import json
 import os
+import shutil
 import sys
+import time
 import urllib.request
+from datetime import datetime, time as dtime, timedelta, timezone
 
 import screener
 
@@ -50,10 +53,65 @@ RWIDTH = (110, 70, 80, 50, 210, 70, 150, 70, 130)
 STATUS_NAME = {"active": "运行中", "done": "已结束", "cancelled": "已停止"}
 
 
+BACKUP = CONF + ".bak"
+
+
+# ---------- 美东时间：美股一个交易日跨北京时间零点，按日期判断的事都用美东时间 ----------
+def _nth_sunday(year, month, n):
+    d = datetime(year, month, 1)
+    return d + timedelta(days=(6 - d.weekday()) % 7 + 7 * (n - 1))
+
+
+def us_now():
+    """美东当前时间（自动处理夏令时），不带时区信息。"""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
+    except Exception:  # 没有时区数据库：按美国夏令时规则（3 月第 2 个周日 ~ 11 月第 1 个周日）自己算
+        utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        start = _nth_sunday(utc.year, 3, 2) + timedelta(hours=7)
+        end = _nth_sunday(utc.year, 11, 1) + timedelta(hours=6)
+        return utc - timedelta(hours=4 if start <= utc < end else 5)
+
+
+def us_date():
+    """美东日期。「每天一次」的提醒用它，同一个交易日里不会因为北京时间过零点又响一次。"""
+    return us_now().strftime("%Y-%m-%d")
+
+
+def market_open(margin_min=0):
+    """现在是否在美股常规交易时段（周一到周五 9:30~16:00 美东，不含节假日）；margin_min 前后各放宽几分钟。"""
+    t = us_now()
+    if t.weekday() >= 5:
+        return False
+    mins = t.hour * 60 + t.minute
+    return 9 * 60 + 30 - margin_min <= mins < 16 * 60 + margin_min
+
+
+def last_session():
+    """最近一个已经收盘的交易日（美东 16:30 之后算当天收完）。每日选股、回测按它判断，
+    盘中不会拿还没收完的 K 线去清除自选。节假日不单独处理（最多多跑一次，结果一样）。"""
+    t = us_now()
+    d = t.date()
+    if t.weekday() >= 5 or t.time() < dtime(16, 30):
+        d -= timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d.strftime("%Y-%m-%d")
+
+
 def load():
     if os.path.exists(CONF):
-        with open(CONF, encoding="utf-8") as f:
-            stored = json.load(f)
+        try:
+            with open(CONF, encoding="utf-8") as f:
+                stored = json.load(f)
+        except ValueError:  # 文件坏了（比如写到一半断电）：用上一次的备份，坏文件留着备查
+            if not os.path.exists(BACKUP):
+                raise
+            shutil.copy2(CONF, CONF + f".broken-{datetime.now():%Y%m%d%H%M%S}")
+            with open(BACKUP, encoding="utf-8") as f:
+                stored = json.load(f)
+            shutil.copyfile(BACKUP, CONF)
         cfg = {**json.loads(json.dumps(DEFAULT)), **stored}
         cfg.pop("risk", None)  # 旧版手动风险规则，已不再使用
         if stored.get("interval", 5) >= 5:  # 旧版默认 5 秒，升级为每秒检测
@@ -67,8 +125,23 @@ def load():
 
 
 def save(cfg):
-    with open(CONF, "w", encoding="utf-8") as f:
+    """先完整写到临时文件再替换，中途断电 / 崩溃也不会留下写了一半的 stocks.json；
+    替换前把上一版存成 stocks.json.bak，读不出来时自动用它。"""
+    tmp = CONF + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    for i in range(5):  # Windows 上杀毒软件等短暂占用文件时，替换会失败，稍等重试
+        try:
+            if os.path.exists(CONF):
+                shutil.copyfile(CONF, BACKUP)
+            os.replace(tmp, CONF)
+            return
+        except PermissionError:
+            if i == 4:
+                raise
+            time.sleep(0.1)
 
 
 def normalize(code):

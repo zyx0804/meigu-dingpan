@@ -16,7 +16,7 @@ import risk
 import rules
 import screener
 import tuner
-from common import DATA, ENV_NAME, INDICES, fetch, fetch_daily, load, normalize, save
+from common import DATA, ENV_NAME, INDICES, fetch, fetch_daily, last_session, load, normalize, save, us_date
 from moomoo_link import MoomooLink, opend_running
 
 STATUS_NAME = {"active": "运行中", "done": "已结束", "cancelled": "已停止"}
@@ -26,6 +26,8 @@ class Engine:
     def __init__(self):
         self.cfg = load()
         self.lock = threading.RLock()  # 网页请求线程和后台线程共用配置，改动时加锁
+        # 下单类操作一次只做一笔：连点两次或开两个网页时，第二次要等第一次下完、记好账再重新检查，不会重复下单
+        self.trade_lock = threading.Lock()
         self.quotes, self.hist, self.reports = {}, {}, {}
         self.fired = {}
         self.link = MoomooLink()
@@ -129,7 +131,7 @@ class Engine:
         self.order_rows, self.order_note = rows, "；".join(notes)
 
     def update_hist(self):
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = us_date()
         for p in self.positions:
             c = p["code"]
             if self.hist.get(c, (None,))[0] == today or "symbol" not in self.quotes.get(c, {}):
@@ -153,7 +155,7 @@ class Engine:
                             entry_date=journal.entry_date(self.cfg["journal"].get("open", {}), c))
             r.update(code=c, name=p["name"], price=price, pos=p)
             reports[c] = r
-            today = datetime.now().strftime("%Y-%m-%d")
+            today = us_date()
             for sig in r["exit_signals"]:
                 key = (c, "exit:" + sig.split(" ")[0])
                 if self.fired.get(key) != today:
@@ -174,7 +176,7 @@ class Engine:
 
     # ---------- 到价提醒 ----------
     def check_alerts(self):
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = us_date()
         for code, a in list(self.cfg["alerts"].items()):
             d = self.quotes.get(code)
             if not d:
@@ -245,8 +247,8 @@ class Engine:
 
     # ---------- 选股 ----------
     def start_screen(self, force=False):
-        today = datetime.now().strftime("%Y-%m-%d")
-        if self.screening or not (force or (self.cfg["auto_screen"] and self.cfg["screen_date"] != today)):
+        # 按「最近一个已收盘的交易日」判断：盘中不会用没收完的 K 线去清除自选
+        if self.screening or not (force or (self.cfg["auto_screen"] and self.cfg["screen_date"] != last_session())):
             return
         self.screening = True
         threading.Thread(target=self._screen, daemon=True).start()
@@ -268,7 +270,7 @@ class Engine:
             self.screening = False
 
     def _apply_screen(self, ranked):
-        today = datetime.now()
+        today, session = datetime.now(), last_session()
         with self.lock:
             cutoff = today.toordinal() - 7
             self.cfg["ignore"] = {c: d for c, d in self.cfg["ignore"].items()
@@ -286,11 +288,11 @@ class Engine:
                     self.cfg["stocks"].append(c)
             self.cfg["screen"] = {x["code"]: {"score": x["score"], "rank": x["rank"], "reason": x["reason"],
                                               "name": x["name"], "eligible": x["eligible"]} for x in ranked}
-            self.cfg["screen_date"] = today.strftime("%Y-%m-%d")
+            self.cfg["screen_date"] = session
             save(self.cfg)
         by = {x["code"]: x for x in ranked}
         name = lambda c: by.get(c, {}).get("name", c)
-        with open(os.path.join(DATA, f"screen_{today:%Y-%m-%d}.csv"), "w", encoding="utf-8-sig") as f:
+        with open(os.path.join(DATA, f"screen_{session}.csv"), "w", encoding="utf-8-sig") as f:
             f.write("排名,代码,名称,评分,符合条件,理由,本次操作\n")
             for x in ranked:
                 f.write(f"{x['rank']},{x['code']},{x['name']},{x['score']},{'是' if x['eligible'] else '否'},"
@@ -302,7 +304,7 @@ class Engine:
 
     # ---------- 回测 + 复盘 + 规则进化（每天一次） ----------
     def start_backtest(self, force=False):
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = last_session()
         if self.backtesting or not (force or self.cfg["bt"].get("date") != today):
             return
         self.backtesting = True
@@ -398,11 +400,25 @@ class Engine:
         return {"rules": rules.rules_text(self.cfg["rule_params"]), "version": self.cfg["rule_params"]["version"],
                 "items": out}
 
+    def _trading(self):
+        if not self.trade_lock.acquire(timeout=0.5):
+            raise ValueError("上一笔下单还在处理，请等它完成后再试")
+
     def protect_execute(self, picks):
         """picks：[{code, early}]。重新按规则生成计划再执行，不信任网页传来的价格。"""
+        self._trading()
+        try:
+            return self._protect_execute(picks)
+        finally:
+            self.trade_lock.release()
+
+    def _protect_execute(self, picks):
         items = {it["code"]: it for it in rules.plan(self.positions, self.reports, self.active_rule_codes())}
-        results = []
+        results, seen = [], set()
         for pk in picks:
+            if pk.get("code") in seen:  # 同一只只处理一次
+                continue
+            seen.add(pk.get("code"))
             it = items.get(pk.get("code"))
             if not it or it["action"] == "skip" or it.get("error"):
                 results.append(f"✗ {pk.get('code')}：按规则不能执行（可能已有保护或数据不足）")
@@ -456,6 +472,13 @@ class Engine:
 
     def buy_execute(self, code, qty):
         """重新按规则算一遍再下单；数量只能等于或少于规则算出的股数。"""
+        self._trading()
+        try:
+            return self._buy_execute(code, qty)
+        finally:
+            self.trade_lock.release()
+
+    def _buy_execute(self, code, qty):
         if not self.link.trd:
             raise ValueError("没有连接 moomoo")
         plan = self.buy_plan(code)
@@ -512,12 +535,20 @@ class Engine:
             self.save()
 
     def _protect_new_buy(self, b, filled, avg):
+        with self.trade_lock:  # 和网页上的「一键挂保护单」错开，同一只不会挂两张止损
+            if b["code"] in self.active_rule_codes() and self.desk.held("REAL", b["code"]) < filled:
+                # 可卖数量已被别的止损单占住：刚才「一键挂保护单」已经把这些股数一起保护了
+                self.log(f"{b['name']} 买入成交 {filled:g} 股，已由现有止损规则覆盖，不再重复挂单", order=True)
+                return
+            self._protect_new_buy_locked(b, filled, avg)
+
+    def _protect_new_buy_locked(self, b, filled, avg):
         q = self.quotes.get(b["code"]) or fetch([b["code"]]).get(b["code"]) or {}
         rows = fetch_daily(q["symbol"], 130)
         pos = {"code": b["code"], "name": b["name"], "qty": filled, "cost": avg, "price": q.get("price", avg),
                "side": "long", "market_val": filled * avg}
         r = risk.assess(pos, q.get("price", avg), (self.acct or {}).get("total_assets"), rows, self.cfg["mode"],
-                        params=self.cfg["rule_params"], entry_date=datetime.now().strftime("%Y-%m-%d"))
+                        params=self.cfg["rule_params"], entry_date=us_date())
         spec, err = orders.build(pos, q.get("price", avg), "stop", round(r["trail_stop"], 2), filled)
         if err:
             raise RuntimeError(err)
