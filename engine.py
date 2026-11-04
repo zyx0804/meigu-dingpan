@@ -16,7 +16,7 @@ import risk
 import rules
 import screener
 import tuner
-from common import DATA, ENV_NAME, INDICES, fetch, fetch_daily, last_session, load, normalize, save, us_date
+from common import DATA, ENV_NAME, INDICES, fetch, fetch_daily, last_session, load, market_open, normalize, save, us_date
 from moomoo_link import MoomooLink, opend_running
 
 STATUS_NAME = {"active": "运行中", "done": "已结束", "cancelled": "已停止"}
@@ -350,34 +350,55 @@ class Engine:
         entries += [(data[c], lot["time"][:10], lot["price"]) for c, lots in open_lots.items() if c in data
                     for lot in lots]
         cur = {k: self.cfg["rule_params"][k] for k in ("loss_cap", "trail", "breakeven")}
-        base, best, cands, w = tuner.suggest(cur, data, entries, len(closed))
+        month = last_session()[:7]
+        # 交易规则每月评估一次（每月第一个交易日收盘后），盘中不换规则；复盘统计照常每天更新
+        tune = self.cfg.get("rule_month") != month and not market_open(10)
+        base, best, cands, w = tuner.suggest(cur, data, entries, len(closed)) if tune else (None, None, [], None)
         brief = lambda ev: ev and {"params": ev["params"], "avg": ev["pooled"]["avg"], "worst": ev["pooled"]["worst"],
                                    "mdd": ev["pooled"]["mdd"], "trades": ev["pooled"]["trades"],
                                    "user_avg": ev["user_avg"], "score": ev["score"]}
         with self.lock:
+            old = self.cfg["journal"]
             self.cfg["journal"] = {"date": datetime.now().strftime("%Y-%m-%d"), "trades": closed, "stats": st,
                                    "insights": journal.insights(closed, st), "open": open_lots, "deals": len(deals),
-                                   "base": brief(base), "weight": w, "entries": len(entries)}
+                                   "base": brief(base) if tune else old.get("base"),
+                                   "weight": w if tune else old.get("weight"), "entries": len(entries),
+                                   "tune_result": old.get("tune_result")}
+            if not tune:
+                save(self.cfg)
+                return
+            self.cfg["rule_month"] = month
             b = brief(best)
-            self.cfg["suggestion"] = b if b and b["params"] != cur else None
-            save(self.cfg)
-        if self.cfg["suggestion"]:
-            p = self.cfg["suggestion"]["params"]
-            self.log(f"规则进化：发现更好的参数（限亏 {p['loss_cap']:g} / 跟踪 {p['trail']:g} / 保本 {p['breakeven']:g} ATR），"
-                     "到「复盘」页查看，点「采用」才会生效")
+            if b and b["params"] != cur:
+                p = b["params"]
+                self.cfg["journal"]["tune_result"] = (f"{month}：已自动换成 限亏 {p['loss_cap']:g} / 跟踪 {p['trail']:g} / "
+                                                      f"保本 {p['breakeven']:g} ATR（平均每笔 {b['avg']:.2f}%，"
+                                                      f"最差一笔 {b['worst']:.1f}%，最大回撤 {b['mdd']:.1f}%）")
+                self._adopt(b, f"{month} 月度规则评估自动采用")
+                self.log(f"月度规则更新：换成 限亏 {p['loss_cap']:g} / 跟踪 {p['trail']:g} / 保本 {p['breakeven']:g} ATR"
+                         f"（v{self.cfg['rule_params']['version']}），不满意可在「复盘」页退回上一版", alert=True)
+            else:
+                self.cfg["suggestion"] = None
+                self.cfg["journal"]["tune_result"] = f"{month}：没有在所有护栏下都更好的参数，规则保持不变"
+                save(self.cfg)
+                self.log(f"{month} 月度规则评估：没有通过全部护栏的更好参数，规则保持 v{self.cfg['rule_params']['version']} 不变")
 
     def adopt_suggestion(self):
         with self.lock:
             sug = self.cfg["suggestion"]
             if not sug:
                 raise ValueError("没有待采用的建议")
+            self._adopt(sug, "手动采用")
+
+    def _adopt(self, sug, how):
+        with self.lock:
             old = dict(self.cfg["rule_params"])
             self.cfg["rule_history"].append({**old, "until": datetime.now().strftime("%Y-%m-%d %H:%M")})
             self.cfg["rule_params"] = {**sug["params"], "version": old["version"] + 1,
                                        "since": datetime.now().strftime("%Y-%m-%d %H:%M")}
             self.cfg["suggestion"] = None
             save(self.cfg)
-        self.log(f"规则升级到 v{self.cfg['rule_params']['version']}：{sug['params']}（旧：{old}）", order=True)
+        self.log(f"规则升级到 v{self.cfg['rule_params']['version']}（{how}）：{sug['params']}（旧：{old}）", order=True)
 
     def rollback_rule(self):
         with self.lock:
@@ -658,4 +679,4 @@ class Engine:
     def journal_state(self):
         return {"journal": self.cfg["journal"], "rule_params": self.cfg["rule_params"],
                 "rule_history": self.cfg["rule_history"][-5:], "suggestion": self.cfg["suggestion"],
-                "bt": self.cfg["bt"]}
+                "bt": self.cfg["bt"], "rule_month": self.cfg.get("rule_month")}

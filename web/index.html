@@ -195,9 +195,9 @@ async function vJournal(){if(!J||Date.now()-jT>15000){J=await api("/api/journal"
    ${(j.trades||[]).slice(-10).map(t=>`<br><span class="${sgn(t.pnl)}">${esc(t.entry_time.slice(0,10))} → ${esc(t.exit_time.slice(0,10))} ${esc(t.name)} ${t.qty} 股 ${n(t.entry)} → ${n(t.exit)} ${n(t.ret*100,1)}%（${esc(t.how||"手动")}）</span>`).join("")}`:"还没有已平仓的交易"}
    ${Object.values(j.open||{}).flat().map(l=>`<br>持仓中：${esc(l.name)} ${l.qty} 股，${esc(l.time.slice(0,10))} 以 ${n(l.price)} 买入`).join("")}</div>
   <div class="box"><h3>复盘发现</h3><ul>${(j.insights||["还没有复盘数据，点「立即分析」"]).map(x=>`<li>${esc(x)}</li>`).join("")}</ul></div>
-  <div class="box"><h3>规则进化</h3>${b?`评估样本：候选池回测 ${b.trades} 笔 + 你的真实买入 ${j.entries} 次；你的交易权重 ${n(j.weight*100,0)}%（已平仓 20 笔后为 100%）
-   <br>当前规则：平均每笔 ${n(b.avg)}% · 最差一笔 ${n(b.worst,1)}% · 最大回撤 ${n(b.mdd,1)}%${b.user_avg!=null?` · 按你的买入复盘 ${n(b.user_avg)}%`:""}
-   ${sug?`<br><span class="up">建议：限亏 ${sug.params.loss_cap} / 跟踪 ${sug.params.trail} / 保本 ${sug.params.breakeven} ATR → 平均每笔 ${n(sug.avg)}% · 最差一笔 ${n(sug.worst,1)}% · 最大回撤 ${n(sug.mdd,1)}%</span><br><span class="sub">已通过护栏：收益更高、最差一笔不更差、回撤不更高、前后两段分开测都不更差</span>`:"<br>目前没有在所有护栏下都更好的参数"}`:"还没有分析结果"}</div>
+  <div class="box"><h3>规则进化 <span class="sub">每月第一个交易日收盘后自动评估，通过全部护栏就自动换新规则${J.rule_month?"；上次评估 "+esc(J.rule_month):""}</span></h3>${j.tune_result?`<b>${esc(j.tune_result)}</b><br>`:""}${b?`上次评估样本：候选池回测 ${b.trades} 笔 + 你的真实买入 ${j.entries} 次；你的交易权重 ${n(j.weight*100,0)}%（已平仓 20 笔后为 100%）
+   <br>评估时的规则：平均每笔 ${n(b.avg)}% · 最差一笔 ${n(b.worst,1)}% · 最大回撤 ${n(b.mdd,1)}%${b.user_avg!=null?` · 按你的买入复盘 ${n(b.user_avg)}%`:""}
+   ${sug?`<br><span class="up">建议：限亏 ${sug.params.loss_cap} / 跟踪 ${sug.params.trail} / 保本 ${sug.params.breakeven} ATR → 平均每笔 ${n(sug.avg)}% · 最差一笔 ${n(sug.worst,1)}% · 最大回撤 ${n(sug.mdd,1)}%</span><br><span class="sub">已通过护栏：收益更高、最差一笔不更差、回撤不更高、前后两段分开测都不更差</span>`:"<br>目前没有在所有护栏下都更好的参数"}`:"还没有月度评估结果"}</div>
   ${bt.results?`<div class="box"><h3>离场规则回测（${esc(bt.date)}，${bt.stocks} 只股票、近 2 年）</h3><div class="tbl"><table><tr><th>规则</th><th>笔数</th><th>胜率</th><th>平均每笔</th><th>累计</th><th>最大回撤</th><th>最差一笔</th></tr>
    ${bt.results.map(r=>`<tr><td>${esc(r.name)}</td><td>${r.trades}</td><td>${n(r.win,0)}%</td><td class="${sgn(r.avg)}">${n(r.avg)}%</td><td>${n(r.total,1)}%</td><td>${n(r.mdd,1)}%</td><td>${n(r.worst,1)}%</td></tr>`).join("")}</table></div><p class="sub">历史表现不代表未来。</p></div>`:""}`}
 render();poll();
