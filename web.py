@@ -122,6 +122,10 @@ class Handler(BaseHTTPRequestHandler):
                 e.rollback_rule()
             elif path == "/api/rule/stop":
                 e.stop_rule(body["id"])
+            elif path == "/api/push/test":
+                e.push_test()
+            elif path == "/api/selfcheck":
+                return self._send(200, {"result": e.self_check()})
             elif path == "/api/order/cancel":
                 e.cancel_order(body["env"], body["order_id"])
             elif path == "/api/order/cancel_all":

@@ -11,17 +11,21 @@ from datetime import datetime
 import backtest
 import brackets
 import journal
+import notify
 import orders
 import risk
 import rules
 import screener
 import tuner
-from common import DATA, ENV_NAME, INDICES, fetch, fetch_daily, last_session, load, market_open, normalize, save, us_date
+from common import (DATA, ENV_NAME, INDICES, fetch, fetch_daily, last_session, load, market_open, normalize, save, us_date,
+                    us_now)
 from moomoo_link import MoomooLink, opend_running
 
 STATUS_NAME = {"active": "运行中", "done": "已结束", "cancelled": "已停止"}
 AUTO_PROTECT_WAIT = 30    # 发现没保护的持仓后等 30 秒再挂，给程序自己的买单流程留时间，也避免读到不完整的持仓
 AUTO_PROTECT_RETRY = 600  # 挂不上（没解锁交易、可卖不足等）时 10 分钟后再试
+DOWN_ALERT_SECS = 120     # moomoo 连接断开超过 2 分钟就推送到手机
+CHECK_FROM, CHECK_TO = (9, 10), (9, 30)  # 开盘前自检：美东 9:10~9:30 之间做一次
 
 
 class Engine:
@@ -34,7 +38,14 @@ class Engine:
         self.fired = {}
         self.link = MoomooLink()
         self.desk = orders.OrderDesk(self.link)
-        self.bm = brackets.BracketManager(self.desk, self.cfg["brackets"], lambda m: self.log(m, order=True))
+        self.bm = brackets.BracketManager(self.desk, self.cfg["brackets"],
+                                          lambda m, alert=False: self.log(m, order=True, alert=alert))
+        if not self.cfg.get("push", {}).get("topic"):
+            self.cfg["push"] = {"enabled": False, "server": notify.DEFAULT_SERVER, "topic": notify.new_topic()}
+            save(self.cfg)
+        self.push = notify.Pusher(self.cfg["push"])
+        self._down_since, self._down_alerted, self._unlock_err = None, False, 0
+        self.check_result = None
         self.acct, self.positions = None, []
         self.acc_status = "未连接：请先打开 moomoo OpenD 并登录"
         self.order_rows, self.order_note = [], ""
@@ -47,6 +58,12 @@ class Engine:
     # ---------- 日志 / 提醒 ----------
     def log(self, msg, order=False, alert=False):
         line = f"[{datetime.now():%H:%M:%S}] {msg}"
+        low = msg.lower()
+        if ("unlock" in low or "解锁" in msg) and not msg.startswith("开盘前自检"):
+            self._unlock_err = time.time()
+        if alert and getattr(self, "push", None) and "风险分" not in msg:  # 风险分每天都会报，不推送
+            urgent = any(k in msg for k in ("止损", "失败", "⚠", "断开", "离场", "撤"))
+            self.push.send("美股盯盘", msg, priority=4 if urgent else 3)
         with self.lock:
             self.logs.insert(0, line)
             del self.logs[200:]
@@ -79,6 +96,8 @@ class Engine:
                 self.refresh_orders()
                 self.check_pending_buys()
                 self.auto_protect()
+                self.watch_connection(t0)
+                self.maybe_self_check()
             if t0 - last_daily >= 60:
                 last_daily = t0
                 self.start_screen()
@@ -249,6 +268,8 @@ class Engine:
                 self.cfg["mode"] = value
             elif key in ("auto_screen", "auto_protect"):
                 self.cfg[key] = bool(value)
+            elif key == "push_enabled":
+                self.cfg["push"]["enabled"] = bool(value)
             elif key in ("risk_pct", "max_pos_pct"):
                 v = float(value)
                 lim = (0.1, 10) if key == "risk_pct" else (5, 100)
@@ -599,6 +620,75 @@ class Engine:
         self.log(f"{b['name']} 买入成交 {filled:g} 股 @ {avg:.2f}，已自动挂动态止损 {r['trail_stop']:.2f}"
                  + (f"、止盈 {r['take_profit']:.2f}" if r.get("take_profit") else ""), alert=True)
 
+    # ---------- 掉线提醒 + 开盘前自检 ----------
+    def watch_connection(self, now):
+        ok = self.acc_status == "已连接"
+        if ok:
+            if self._down_alerted:
+                self.log("moomoo 连接已恢复", alert=True)
+            self._down_since, self._down_alerted = None, False
+            return
+        if self._down_since is None:
+            self._down_since = now
+        elif now - self._down_since > DOWN_ALERT_SECS and not self._down_alerted:
+            self._down_alerted = True
+            self.log(f"⚠ moomoo 连接断开超过 2 分钟：{self.acc_status}。止损单在服务器上照常有效，"
+                     "但自动上调止损、止盈盯价、自动保护都停了", alert=True)
+
+    def maybe_self_check(self):
+        t = us_now()
+        if t.weekday() >= 5 or not CHECK_FROM <= (t.hour, t.minute) < CHECK_TO or self.cfg.get("check_date") == us_date():
+            return
+        self.self_check()
+
+    def self_check(self):
+        """开盘前检查：连接、解锁、每只持仓的止损单是否真的在服务器上、选股回测是否跑了。结果推送到手机。"""
+        problems, oks = [], []
+        if not (self.link.trd and self.acc_status == "已连接"):
+            problems.append(f"moomoo 没连上（{self.acc_status}）")
+        else:
+            oks.append("moomoo 已连接")
+        if time.time() - self._unlock_err < 86400:
+            problems.append("最近 24 小时有操作因为没解锁交易失败：请在 OpenD 窗口里点「解锁交易」")
+        live = {o["order_id"] for o in self.order_rows if o["env"] == "REAL"}
+        covered = {}
+        for b in self.cfg["brackets"]:
+            if b["status"] != "active" or b["env"] != "REAL":
+                continue
+            c = "us" + b["code"].split(".", 1)[1]
+            covered[c] = covered.get(c, 0) + b["qty"]
+            if self.link.trd and b["stop_id"] not in live:
+                problems.append(f"{b['code']} 的止损单 {b['stop_id']} 在 moomoo 上找不到了（可能被撤或过期）")
+        for p in self.positions:
+            gap = p["qty"] - covered.get(p["code"], 0)
+            if gap > 0:
+                problems.append(f"{p['name']} 有 {gap:g} 股没有止损保护")
+        if self.positions and not any("没有止损" in x or "找不到" in x for x in problems):
+            oks.append(f"{len(self.positions)} 只持仓都有止损单")
+        session = last_session()
+        if self.cfg["auto_screen"] and self.cfg["screen_date"] != session:
+            problems.append(f"{session} 收盘后的每日选股没跑成功")
+        if self.cfg["bt"].get("date") != session:
+            problems.append(f"{session} 收盘后的回测 / 复盘没跑成功")
+        if str(self.updated).startswith("获取失败"):
+            problems.append(f"行情获取失败：{self.updated}")
+        with self.lock:
+            self.cfg["check_date"] = us_date()
+            save(self.cfg)
+        self.check_result = {"time": datetime.now().strftime("%m-%d %H:%M"), "problems": problems, "oks": oks}
+        if problems:
+            msg = f"开盘前自检：发现 {len(problems)} 个问题\n" + "\n".join("· " + x for x in problems)
+            self.log(msg.replace("\n", " "), order=True, alert=True)
+        else:
+            msg = "开盘前自检 ✓ 一切正常：" + "；".join(oks)
+            self.log(msg)
+            self.push.send("美股盯盘", msg, priority=2)
+        return self.check_result
+
+    def push_test(self):
+        self.push.send("美股盯盘", f"测试推送 ✓ 能收到这条，就说明手机推送设置好了（{datetime.now():%H:%M:%S}）",
+                       priority=3, force=True)
+
     # ---------- 自动保护：在 moomoo App 里买的股票也自动挂止损 + 止盈 ----------
     def _once(self, code, kind, msg, alert=True):
         key, today = (code, "ap:" + kind), us_date()
@@ -758,6 +848,7 @@ class Engine:
                 "pending_buys": [b for b in cfg["pending_buys"] if b["status"] == "pending"],
                 "settings": {"mode": cfg["mode"], "modes": {k: v[0] for k, v in risk.MODES.items()},
                              "auto_screen": cfg["auto_screen"], "auto_protect": cfg.get("auto_protect", True), "buy": cfg["buy"],
+                             "push": {**cfg["push"], **self.push.status}, "check": self.check_result,
                              "rule_params": cfg["rule_params"]},
                 "screening": self.screening, "backtesting": self.backtesting,
                 "screen_date": cfg["screen_date"], "bt_date": cfg["bt"].get("date"),

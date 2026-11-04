@@ -16,7 +16,7 @@ DEAD = {"CANCELLED_ALL", "CANCELLED_PART", "DELETED", "FAILED", "SUBMIT_FAILED",
 
 class BracketManager:
     def __init__(self, desk, store, log):
-        """store：持久化的规则列表（存在 stocks.json 里）；log(msg)：写日志。"""
+        """store：持久化的规则列表（存在 stocks.json 里）；log(msg, alert=False)：写日志，alert=True 的会响铃并推送到手机。"""
         self.desk, self.store, self.log = desk, store, log
 
     def create(self, stop_spec, target_spec, env, server_target=True):
@@ -112,11 +112,11 @@ class BracketManager:
             # 为了止盈撤掉了止损、挂了限价卖单：卖单成交就结束；没成交（过期/被撤）就把止损挂回去
             if tgt_st in DONE:
                 b["status"] = "done"
-                self.log(f"规则 {b['id']} 止盈卖单已成交，规则结束")
+                self.log(f"规则 {b['id']} 止盈卖单已成交，规则结束", alert=True)
             elif tgt_st in DEAD:
                 b["stop_id"] = self.desk.place(b["stop_desc"], env)
                 b.update(target_id=None, mode="local", phase=None)
-                self.log(f"规则 {b['id']} 止盈卖单没成交（{tgt_st}），已重新挂回止损单 {b['stop_id']}")
+                self.log(f"规则 {b['id']} 止盈卖单没成交（{tgt_st}），已重新挂回止损单 {b['stop_id']}", alert=True)
             return
 
         if stop_st in DONE or tgt_st in DONE:
@@ -124,18 +124,18 @@ class BracketManager:
             if other:
                 self._cancel_quiet(other, env)
             b["status"] = "done"
-            self.log(f"规则 {b['id']} {'止损' if stop_st in DONE else '止盈'}已成交，已撤销另一边，规则结束")
+            self.log(f"规则 {b['id']} {'止损' if stop_st in DONE else '止盈'}已成交，已撤销另一边，规则结束", alert=True)
             return
         if held(env, local) <= 0:  # 持仓已经没了（你手动卖掉了等）
             for oid in (b["stop_id"], b["target_id"]):
                 if oid:
                     self._cancel_quiet(oid, env)
             b["status"] = "done"
-            self.log(f"规则 {b['id']} {b['code']} 已无持仓，撤掉剩余挂单，规则结束")
+            self.log(f"规则 {b['id']} {b['code']} 已无持仓，撤掉剩余挂单，规则结束", alert=True)
             return
         if stop_st in DEAD:
             b["status"] = "done"
-            self.log(f"规则 {b['id']} 的止损单状态为 {stop_st}（可能被你在 moomoo 里撤了），规则结束")
+            self.log(f"规则 {b['id']} 的止损单状态为 {stop_st}（可能被你在 moomoo 里撤了），规则结束", alert=True)
             return
 
         if b["mode"] == "local" and b["target"] and rth:
@@ -161,10 +161,10 @@ class BracketManager:
                     b["target_id"] = self.desk.place(spec, env)
                 except Exception as e:  # 卖单挂不出去：马上把止损挂回去，不能让持仓裸奔
                     b["stop_id"] = self.desk.place(b["stop_desc"], env)
-                    self.log(f"规则 {b['id']} 止盈卖单失败（{str(e)[:60]}），已重新挂回止损单 {b['stop_id']}")
+                    self.log(f"规则 {b['id']} 止盈卖单失败（{str(e)[:60]}），已重新挂回止损单 {b['stop_id']}", alert=True)
                     return
                 b["phase"] = "selling"
-                self.log(f"规则 {b['id']} 价格 {px} 到达止盈 {b['target']}：已撤止损，限价 {limit} 卖出，订单号 {b['target_id']}")
+                self.log(f"规则 {b['id']} 价格 {px} 到达止盈 {b['target']}：已撤止损，限价 {limit} 卖出，订单号 {b['target_id']}", alert=True)
 
     def _cancel_quiet(self, oid, env):
         try:
