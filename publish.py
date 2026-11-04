@@ -69,6 +69,10 @@ def main():
         tracked = subprocess.run(["git", "ls-files", f], cwd=ROOT, capture_output=True, text=True).stdout.strip()
         if tracked:
             sys.exit(f"停止：{f} 被 git 跟踪了，里面是个人数据，不能上传")
+    branch = git_out("branch", "--show-current").decode().strip()
+    if branch != "main":
+        sys.exit(f"停止：现在在 {branch} 分支。请在主目录（main 分支）里运行 publish.py，"
+                 "否则 Release 打包的代码和签名对不上")
     key = ensure_key()
     path = os.path.join(ROOT, "VERSION")
     major, minor, patch = (int(x) for x in open(path, encoding="utf-8").read().strip().split("."))
@@ -78,6 +82,7 @@ def main():
     run("git", "add", "-A")
     run("git", "commit", "-m", f"v{ver}: {notes}")
     manifest, sig = signed_manifest(ver, key)
+    head = git_out("rev-parse", "HEAD").decode().strip()
     run("git", "push")
     with tempfile.TemporaryDirectory() as d:
         mp, sp = os.path.join(d, "manifest.json"), os.path.join(d, "manifest.sig")
@@ -85,7 +90,7 @@ def main():
             f.write(manifest)
         with open(sp, "wb") as f:
             f.write(sig)
-        run("gh", "release", "create", f"v{ver}", "--title", f"v{ver}", "--notes", notes, mp, sp)
+        run("gh", "release", "create", f"v{ver}", "--target", head, "--title", f"v{ver}", "--notes", notes, mp, sp)
     print(f"已发布 v{ver}（已签名），朋友的程序会在 6 小时内（或下次启动时）收盘后自动更新。")
 
 

@@ -20,6 +20,8 @@ from common import DATA, ENV_NAME, INDICES, fetch, fetch_daily, last_session, lo
 from moomoo_link import MoomooLink, opend_running
 
 STATUS_NAME = {"active": "运行中", "done": "已结束", "cancelled": "已停止"}
+AUTO_PROTECT_WAIT = 30    # 发现没保护的持仓后等 30 秒再挂，给程序自己的买单流程留时间，也避免读到不完整的持仓
+AUTO_PROTECT_RETRY = 600  # 挂不上（没解锁交易、可卖不足等）时 10 分钟后再试
 
 
 class Engine:
@@ -38,6 +40,7 @@ class Engine:
         self.order_rows, self.order_note = [], ""
         self.logs, self.events = [], []  # events：给网页弹提醒用
         self.screening = self.backtesting = False
+        self._unprot, self._ap_retry = {}, {}  # 自动保护：代码 -> 第一次发现没保护的时间 / 下次重试时间
         self.updated = ""
         os.makedirs(DATA, exist_ok=True)
 
@@ -75,6 +78,7 @@ class Engine:
                 self.refresh_account()
                 self.refresh_orders()
                 self.check_pending_buys()
+                self.auto_protect()
             if t0 - last_daily >= 60:
                 last_daily = t0
                 self.start_screen()
@@ -141,6 +145,15 @@ class Engine:
             except Exception:
                 pass
 
+    def _cash(self):
+        return self.link.acc_type == "CASH"
+
+    def t1_hold(self):
+        """现金账户里今天买入过的代码：今天不止盈卖出（T+1）。"""
+        if not self._cash():
+            return set()
+        return {p["code"] for p in self.positions if p.get("today_buy", 0) > 0}
+
     def active_rule_codes(self):
         return {"us" + b["code"].split(".", 1)[1] for b in self.cfg["brackets"]
                 if b["status"] == "active" and b["env"] == "REAL"}
@@ -171,7 +184,7 @@ class Engine:
         tps = {c: r["take_profit"] for c, r in self.reports.items() if r.get("take_profit")}
         with self.lock:
             before = json.dumps(self.cfg["brackets"], sort_keys=True, default=str)
-            self.bm.tick(prices, self.desk.position_qty, dyn, tps, market_open())
+            self.bm.tick(prices, self.desk.position_qty, dyn, tps, market_open(), self.t1_hold())
             if json.dumps(self.cfg["brackets"], sort_keys=True, default=str) != before:
                 save(self.cfg)
 
@@ -234,8 +247,8 @@ class Engine:
         with self.lock:
             if key == "mode" and value in risk.MODES:
                 self.cfg["mode"] = value
-            elif key == "auto_screen":
-                self.cfg["auto_screen"] = bool(value)
+            elif key in ("auto_screen", "auto_protect"):
+                self.cfg[key] = bool(value)
             elif key in ("risk_pct", "max_pos_pct"):
                 v = float(value)
                 lim = (0.1, 10) if key == "risk_pct" else (5, 100)
@@ -413,7 +426,7 @@ class Engine:
 
     # ---------- 一键挂保护单 ----------
     def protect_plan(self):
-        items = rules.plan(self.positions, self.reports, self.active_rule_codes())
+        items = rules.plan(self.positions, self.reports, self.active_rule_codes(), self.t1_hold())
         out = []
         for it in items:
             out.append({"code": it["code"], "name": it["name"], "qty": it["qty"], "action": it["action"],
@@ -436,7 +449,8 @@ class Engine:
             self.trade_lock.release()
 
     def _protect_execute(self, picks):
-        items = {it["code"]: it for it in rules.plan(self.positions, self.reports, self.active_rule_codes())}
+        items = {it["code"]: it for it in rules.plan(self.positions, self.reports, self.active_rule_codes(),
+                                                     self.t1_hold())}
         results, seen = [], set()
         for pk in picks:
             if pk.get("code") in seen:  # 同一只只处理一次
@@ -458,7 +472,8 @@ class Engine:
                     self.log(f"一键：规则离场 {orders.describe(s, 'REAL')} 订单号 {oid}", order=True)
                 else:
                     with self.lock:
-                        _, notes = self.bm.create(it["specs"][0], it["specs"][1] if len(it["specs"]) > 1 else None, "REAL")
+                        _, notes = self.bm.create(it["specs"][0], it["specs"][1] if len(it["specs"]) > 1 else None,
+                                                  "REAL", server_target=not self._cash())
                         save(self.cfg)
                     results.append(f"✓ {it['name']}：" + "；".join(notes))
             except Exception as e:
@@ -579,10 +594,75 @@ class Engine:
         if r.get("take_profit"):
             tgt, _ = orders.build(pos, q.get("price", avg), "target", round(r["take_profit"], 2), filled)
         with self.lock:
-            _, notes = self.bm.create(spec, tgt, "REAL")
+            _, notes = self.bm.create(spec, tgt, "REAL", server_target=not self._cash())
             save(self.cfg)
         self.log(f"{b['name']} 买入成交 {filled:g} 股 @ {avg:.2f}，已自动挂动态止损 {r['trail_stop']:.2f}"
                  + (f"、止盈 {r['take_profit']:.2f}" if r.get("take_profit") else ""), alert=True)
+
+    # ---------- 自动保护：在 moomoo App 里买的股票也自动挂止损 + 止盈 ----------
+    def _once(self, code, kind, msg, alert=True):
+        key, today = (code, "ap:" + kind), us_date()
+        if self.fired.get(key) != today:
+            self.fired[key] = today
+            self.log(msg, order=True, alert=alert)
+
+    def auto_protect(self):
+        """真实账户里没有被自动规则覆盖的股数（比如你在 moomoo App 里买的、或者加仓的部分），
+        按「一键挂保护单」同一套规则自动挂止损 + 止盈。只会卖出已有的股票，不会买入或加仓。
+        已经跌破止损 / 到了止盈的不会自动卖，只提醒你。"""
+        if not self.cfg.get("auto_protect", True) or not self.link.trd:
+            return
+        now = time.time()
+        pending = {b["code"] for b in self.cfg["pending_buys"] if b["status"] == "pending"}
+        covered = {}
+        for b in self.cfg["brackets"]:
+            if b["status"] == "active" and b["env"] == "REAL":
+                c = "us" + b["code"].split(".", 1)[1]
+                covered[c] = covered.get(c, 0) + b["qty"]
+        need_by = {p["code"]: p["qty"] - covered.get(p["code"], 0) for p in self.positions}
+        created = False
+        for c in [c for c in self._unprot if need_by.get(c, 0) <= 0]:
+            self._unprot.pop(c, None)
+        for p in self.positions:
+            c, need = p["code"], need_by[p["code"]]
+            if need <= 0 or c in pending or now < self._ap_retry.get(c, 0):
+                continue
+            if now - self._unprot.setdefault(c, now) < AUTO_PROTECT_WAIT or c not in self.reports:
+                continue
+            pc = {**p, "qty": int(need) if float(need).is_integer() else need}
+            it = rules.plan([pc], self.reports, set(), self.t1_hold())[0]
+            if it["action"] == "exit":
+                self._once(c, "exit", f"⚠ {p['name']} 有 {need:g} 股没有保护，而且{it['why']}：没有自动卖出，"
+                                      "请到「持仓 · 风险」点「一键挂保护单」确认离场，或在 moomoo 里自己处理")
+                self._ap_retry[c] = now + AUTO_PROTECT_RETRY
+                continue
+            if it["action"] != "protect" or it.get("error") or not it["specs"]:
+                self._ap_retry[c] = now + AUTO_PROTECT_RETRY
+                continue
+            if not self.trade_lock.acquire(blocking=False):  # 网页上正在下单：下一轮再来
+                continue
+            try:
+                if self.desk.held("REAL", c) < need:
+                    self._once(c, "frozen", f"{p['name']} 有 {need:g} 股没有程序的保护，但可卖数量不够"
+                                            "（可能你在 moomoo 里已经挂了卖单），没有自动挂", alert=False)
+                    self._ap_retry[c] = now + AUTO_PROTECT_RETRY
+                    continue
+                with self.lock:
+                    specs = it["specs"]
+                    _, notes = self.bm.create(specs[0], specs[1] if len(specs) > 1 else None, "REAL",
+                                              server_target=not self._cash())
+                    save(self.cfg)
+                self._unprot.pop(c, None)
+                created = True
+                self.log(f"自动保护：{p['name']} {need:g} 股不在规则里，已按规则挂上保护（{it['why']}）", order=True,
+                         alert=True)
+            except Exception as e:
+                self._ap_retry[c] = now + AUTO_PROTECT_RETRY
+                self._once(c, "fail", f"⚠ 自动保护 {p['name']} 失败：{self._explain(e)}（10 分钟后再试）")
+            finally:
+                self.trade_lock.release()
+        if created:
+            self.refresh_orders()
 
     # ---------- 挂单 / 规则 ----------
     def cancel_order(self, env, oid):
@@ -677,7 +757,7 @@ class Engine:
                 "events": [e for e in self.events if e["id"] > since_event],
                 "pending_buys": [b for b in cfg["pending_buys"] if b["status"] == "pending"],
                 "settings": {"mode": cfg["mode"], "modes": {k: v[0] for k, v in risk.MODES.items()},
-                             "auto_screen": cfg["auto_screen"], "buy": cfg["buy"],
+                             "auto_screen": cfg["auto_screen"], "auto_protect": cfg.get("auto_protect", True), "buy": cfg["buy"],
                              "rule_params": cfg["rule_params"]},
                 "screening": self.screening, "backtesting": self.backtesting,
                 "screen_date": cfg["screen_date"], "bt_date": cfg["bt"].get("date"),
