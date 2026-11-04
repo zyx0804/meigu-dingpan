@@ -27,7 +27,7 @@ DEFAULT = {
     "brackets": [],       # 止损 + 止盈联动规则
     "bt": {},             # 最近一次离场规则回测：{date, k, scope, results}
     # 动态止损参数：会根据你的交易逐步调整；每次调整都记在 rule_history 里
-    "rule_params": {"loss_cap": 1.0, "trail": 3.0, "breakeven": 3.0, "version": 1, "since": ""},
+    "rule_params": {"loss_cap": 1.0, "trail": 3.0, "breakeven": 3.0, "target": 6.0, "version": 1, "since": ""},
     "rule_history": [],
     "journal": {},        # 交易复盘：{date, trades, stats, insights, open}
     "suggestion": None,   # 规则进化建议（需要你点「采用」才生效）
@@ -114,6 +114,9 @@ def load():
             shutil.copyfile(BACKUP, CONF)
         cfg = {**json.loads(json.dumps(DEFAULT)), **stored}
         cfg.pop("risk", None)  # 旧版手动风险规则，已不再使用
+        cfg["rule_params"].setdefault("target", 6.0)  # 旧版没有止盈：升级后默认成本 + 6 ATR
+        if cfg.get("suggestion") and "target" not in cfg["suggestion"]["params"]:
+            cfg["suggestion"] = None  # 旧版（没有止盈）的建议已过时，等月度评估重新算
         if stored.get("interval", 5) >= 5:  # 旧版默认 5 秒，升级为每秒检测
             cfg["interval"] = 1
         if "auto" not in stored:  # 第一次启用自动选股：程序预设的几只（非你手动加的）交给自动选股管理

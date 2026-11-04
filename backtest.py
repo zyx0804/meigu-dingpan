@@ -35,6 +35,8 @@ STRATEGIES = {
     # 限亏 + 放宽跟踪：一开始最多亏 1ATR，之后最高价回撤 3ATR 跟踪；浮盈 3ATR 才移到保本
     "限亏1ATR + 3ATR跟踪（浮盈3ATR保本）": ("staged", 1.0, 3.0, 0.0, 3.0),
     "限亏1ATR + 2.5ATR跟踪（浮盈3ATR保本）": ("staged", 1.0, 3.0, 0.0, 2.5),
+    "限亏1ATR + 3ATR跟踪 + 止盈4ATR": ("staged", 1.0, 3.0, 0.0, 3.0, 4.0),
+    "限亏1ATR + 3ATR跟踪 + 止盈6ATR": ("staged", 1.0, 3.0, 0.0, 3.0, 6.0),
 }
 
 
@@ -70,7 +72,9 @@ def run_one(rows, strat):
         elif kind == "trail":
             stop = entry - p[0] * a0
         elif kind == "staged":
-            stop = staged_stop(entry, entry, a0, *p)
+            stop = staged_stop(entry, entry, a0, *p[:4])
+            if len(p) > 4 and p[4]:  # 第 5 个参数：止盈 = 买入价 + N 个 ATR（0 表示不设止盈）
+                target = entry + p[4] * a0
         high = rows[e][3]
         close_stop = entry - p[0] * a0 if kind == "risk" else None  # 只认收盘价，不怕盘中插针
         exit_px, j = None, e
@@ -97,7 +101,7 @@ def run_one(rows, strat):
             if kind == "trail":  # 收盘后按新高上移止损，只升不降
                 stop = max(stop, high - p[0] * a0)
             if kind == "staged":
-                stop = max(stop, staged_stop(entry, high, a0, *p))
+                stop = max(stop, staged_stop(entry, high, a0, *p[:4]))
             if kind == "risk":
                 close_stop = max(close_stop, c - p[0] * _atr(rows, j))
             j += 1

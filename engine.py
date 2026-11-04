@@ -168,9 +168,10 @@ class Engine:
             return
         prices = {c: d.get("price") for c, d in self.quotes.items()}
         dyn = {c: r["trail_stop"] for c, r in self.reports.items() if r.get("trail_stop")}
+        tps = {c: r["take_profit"] for c, r in self.reports.items() if r.get("take_profit")}
         with self.lock:
             before = json.dumps(self.cfg["brackets"], sort_keys=True, default=str)
-            self.bm.tick(prices, self.desk.position_qty, dyn)
+            self.bm.tick(prices, self.desk.position_qty, dyn, tps, market_open())
             if json.dumps(self.cfg["brackets"], sort_keys=True, default=str) != before:
                 save(self.cfg)
 
@@ -349,7 +350,7 @@ class Engine:
         entries = [(data[t["code"]], t["entry_time"][:10], t["entry"]) for t in closed if t["code"] in data]
         entries += [(data[c], lot["time"][:10], lot["price"]) for c, lots in open_lots.items() if c in data
                     for lot in lots]
-        cur = {k: self.cfg["rule_params"][k] for k in ("loss_cap", "trail", "breakeven")}
+        cur = {k: self.cfg["rule_params"][k] for k in tuner.KEYS}
         month = last_session()[:7]
         # 交易规则每月评估一次（每月第一个交易日收盘后），盘中不换规则；复盘统计照常每天更新
         tune = self.cfg.get("rule_month") != month and not market_open(10)
@@ -372,10 +373,11 @@ class Engine:
             if b and b["params"] != cur:
                 p = b["params"]
                 self.cfg["journal"]["tune_result"] = (f"{month}：已自动换成 限亏 {p['loss_cap']:g} / 跟踪 {p['trail']:g} / "
-                                                      f"保本 {p['breakeven']:g} ATR（平均每笔 {b['avg']:.2f}%，"
+                                                      f"保本 {p['breakeven']:g} / 止盈 {p['target']:g} ATR（平均每笔 {b['avg']:.2f}%，"
                                                       f"最差一笔 {b['worst']:.1f}%，最大回撤 {b['mdd']:.1f}%）")
                 self._adopt(b, f"{month} 月度规则评估自动采用")
-                self.log(f"月度规则更新：换成 限亏 {p['loss_cap']:g} / 跟踪 {p['trail']:g} / 保本 {p['breakeven']:g} ATR"
+                self.log(f"月度规则更新：换成 限亏 {p['loss_cap']:g} / 跟踪 {p['trail']:g} / 保本 {p['breakeven']:g} / "
+                         f"止盈 {p['target']:g} ATR"
                          f"（v{self.cfg['rule_params']['version']}），不满意可在「复盘」页退回上一版", alert=True)
             else:
                 self.cfg["suggestion"] = None
@@ -394,7 +396,7 @@ class Engine:
         with self.lock:
             old = dict(self.cfg["rule_params"])
             self.cfg["rule_history"].append({**old, "until": datetime.now().strftime("%Y-%m-%d %H:%M")})
-            self.cfg["rule_params"] = {**sug["params"], "version": old["version"] + 1,
+            self.cfg["rule_params"] = {"target": old.get("target", 6.0), **sug["params"], "version": old["version"] + 1,
                                        "since": datetime.now().strftime("%Y-%m-%d %H:%M")}
             self.cfg["suggestion"] = None
             save(self.cfg)
@@ -405,7 +407,7 @@ class Engine:
             if not self.cfg["rule_history"]:
                 raise ValueError("没有可以退回的版本")
             prev = self.cfg["rule_history"].pop()
-            self.cfg["rule_params"] = {k: prev[k] for k in ("loss_cap", "trail", "breakeven", "version", "since")}
+            self.cfg["rule_params"] = {"target": 6.0, **{k: prev[k] for k in prev if k != "until"}}
             save(self.cfg)
         self.log(f"规则退回 v{prev['version']}", order=True)
 
@@ -573,10 +575,14 @@ class Engine:
         spec, err = orders.build(pos, q.get("price", avg), "stop", round(r["trail_stop"], 2), filled)
         if err:
             raise RuntimeError(err)
+        tgt = None
+        if r.get("take_profit"):
+            tgt, _ = orders.build(pos, q.get("price", avg), "target", round(r["take_profit"], 2), filled)
         with self.lock:
-            _, notes = self.bm.create(spec, None, "REAL")
+            _, notes = self.bm.create(spec, tgt, "REAL")
             save(self.cfg)
-        self.log(f"{b['name']} 买入成交 {filled:g} 股 @ {avg:.2f}，已自动挂动态止损 {r['trail_stop']:.2f}", alert=True)
+        self.log(f"{b['name']} 买入成交 {filled:g} 股 @ {avg:.2f}，已自动挂动态止损 {r['trail_stop']:.2f}"
+                 + (f"、止盈 {r['take_profit']:.2f}" if r.get("take_profit") else ""), alert=True)
 
     # ---------- 挂单 / 规则 ----------
     def cancel_order(self, env, oid):
@@ -644,6 +650,7 @@ class Engine:
             pos.append({"code": c, "name": r["name"], "qty": p["qty"], "side": p["side"], "cost": p["cost"],
                         "price": r["price"], "pl_pct": r["pl_pct"], "weight": r["weight"], "atr_pct": r["atr_pct"],
                         "risk_score": r["risk_score"], "trail_stop": r["trail_stop"], "stage": r.get("stop_stage"),
+                        "take_profit": r.get("take_profit"),
                         "protected": c in prot, "signals": r["exit_signals"], "reasons": r["reasons"],
                         "level": risk.LEVELS[r["level"]] if r["level"] is not None else None,
                         "max_loss": r.get("max_loss"), "stop_loss_usd": r.get("stop_loss_usd"),

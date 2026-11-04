@@ -10,12 +10,14 @@ import itertools
 
 import backtest
 
-GRID = {"loss_cap": (0.75, 1.0, 1.25, 1.5), "trail": (2.0, 2.5, 3.0, 3.5), "breakeven": (2.0, 3.0, 4.0)}
+GRID = {"loss_cap": (0.75, 1.0, 1.25, 1.5), "trail": (2.0, 2.5, 3.0, 3.5), "breakeven": (2.0, 3.0, 4.0),
+        "target": (4.0, 6.0, 8.0)}  # 止盈：买入价 + N 个 ATR（始终保留止盈，只调位置）
+KEYS = tuple(GRID)
 FULL_WEIGHT_TRADES = 20
 
 
 def _strat(p):
-    return ("staged", p["loss_cap"], p["breakeven"], 0.0, p["trail"])
+    return ("staged", p["loss_cap"], p["breakeven"], 0.0, p["trail"], p.get("target", 0.0))
 
 
 def replay_entry(rows, entry_date, entry_price, p):
@@ -25,7 +27,8 @@ def replay_entry(rows, entry_date, entry_price, p):
         return None
     a0 = backtest._atr(rows, idx - 1)
     entry = entry_price * (1 + backtest.COST)
-    stop = backtest.staged_stop(entry, entry, a0, *_strat(p)[1:])
+    stop = backtest.staged_stop(entry, entry, a0, *_strat(p)[1:5])
+    target = entry + p["target"] * a0 if p.get("target") else None
     high = rows[idx][3]
     for j in range(idx, len(rows)):
         o, h, l = rows[j][1], rows[j][3], rows[j][4]
@@ -33,8 +36,10 @@ def replay_entry(rows, entry_date, entry_price, p):
             return o * (1 - backtest.COST) / entry - 1
         if l <= stop:
             return stop * (1 - backtest.COST) / entry - 1
+        if target and h >= target:
+            return max(o, target) * (1 - backtest.COST) / entry - 1
         high = max(high, h)
-        stop = max(stop, backtest.staged_stop(entry, high, a0, *_strat(p)[1:]))
+        stop = max(stop, backtest.staged_stop(entry, high, a0, *_strat(p)[1:5]))
     return rows[-1][2] * (1 - backtest.COST) / entry - 1
 
 
@@ -64,11 +69,12 @@ def suggest(current, pooled, user_entries, closed_count):
             return (1 - w) * s + w * ev["user_avg"]
         return s
 
+    current = {k: current.get(k, 0.0) for k in KEYS}
     base = evaluate(current, pooled, user_entries)
     cands = []
-    for lc, tr, be in itertools.product(GRID["loss_cap"], GRID["trail"], GRID["breakeven"]):
-        p = {"loss_cap": lc, "trail": tr, "breakeven": be}
-        ev = base if p == {k: current[k] for k in p} else evaluate(p, pooled, user_entries)
+    for values in itertools.product(*GRID.values()):
+        p = dict(zip(KEYS, values))
+        ev = base if p == current else evaluate(p, pooled, user_entries)
         ev["score"] = score(ev)
         cands.append(ev)
     base["score"] = score(base)
