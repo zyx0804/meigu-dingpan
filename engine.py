@@ -145,6 +145,15 @@ class Engine:
             except Exception:
                 pass
 
+    def _cash(self):
+        return self.link.acc_type == "CASH"
+
+    def t1_hold(self):
+        """现金账户里今天买入过的代码：今天不止盈卖出（T+1）。"""
+        if not self._cash():
+            return set()
+        return {p["code"] for p in self.positions if p.get("today_buy", 0) > 0}
+
     def active_rule_codes(self):
         return {"us" + b["code"].split(".", 1)[1] for b in self.cfg["brackets"]
                 if b["status"] == "active" and b["env"] == "REAL"}
@@ -175,7 +184,7 @@ class Engine:
         tps = {c: r["take_profit"] for c, r in self.reports.items() if r.get("take_profit")}
         with self.lock:
             before = json.dumps(self.cfg["brackets"], sort_keys=True, default=str)
-            self.bm.tick(prices, self.desk.position_qty, dyn, tps, market_open())
+            self.bm.tick(prices, self.desk.position_qty, dyn, tps, market_open(), self.t1_hold())
             if json.dumps(self.cfg["brackets"], sort_keys=True, default=str) != before:
                 save(self.cfg)
 
@@ -417,7 +426,7 @@ class Engine:
 
     # ---------- 一键挂保护单 ----------
     def protect_plan(self):
-        items = rules.plan(self.positions, self.reports, self.active_rule_codes())
+        items = rules.plan(self.positions, self.reports, self.active_rule_codes(), self.t1_hold())
         out = []
         for it in items:
             out.append({"code": it["code"], "name": it["name"], "qty": it["qty"], "action": it["action"],
@@ -440,7 +449,8 @@ class Engine:
             self.trade_lock.release()
 
     def _protect_execute(self, picks):
-        items = {it["code"]: it for it in rules.plan(self.positions, self.reports, self.active_rule_codes())}
+        items = {it["code"]: it for it in rules.plan(self.positions, self.reports, self.active_rule_codes(),
+                                                     self.t1_hold())}
         results, seen = [], set()
         for pk in picks:
             if pk.get("code") in seen:  # 同一只只处理一次
@@ -462,7 +472,8 @@ class Engine:
                     self.log(f"一键：规则离场 {orders.describe(s, 'REAL')} 订单号 {oid}", order=True)
                 else:
                     with self.lock:
-                        _, notes = self.bm.create(it["specs"][0], it["specs"][1] if len(it["specs"]) > 1 else None, "REAL")
+                        _, notes = self.bm.create(it["specs"][0], it["specs"][1] if len(it["specs"]) > 1 else None,
+                                                  "REAL", server_target=not self._cash())
                         save(self.cfg)
                     results.append(f"✓ {it['name']}：" + "；".join(notes))
             except Exception as e:
@@ -583,7 +594,7 @@ class Engine:
         if r.get("take_profit"):
             tgt, _ = orders.build(pos, q.get("price", avg), "target", round(r["take_profit"], 2), filled)
         with self.lock:
-            _, notes = self.bm.create(spec, tgt, "REAL")
+            _, notes = self.bm.create(spec, tgt, "REAL", server_target=not self._cash())
             save(self.cfg)
         self.log(f"{b['name']} 买入成交 {filled:g} 股 @ {avg:.2f}，已自动挂动态止损 {r['trail_stop']:.2f}"
                  + (f"、止盈 {r['take_profit']:.2f}" if r.get("take_profit") else ""), alert=True)
@@ -619,7 +630,7 @@ class Engine:
             if now - self._unprot.setdefault(c, now) < AUTO_PROTECT_WAIT or c not in self.reports:
                 continue
             pc = {**p, "qty": int(need) if float(need).is_integer() else need}
-            it = rules.plan([pc], self.reports, set())[0]
+            it = rules.plan([pc], self.reports, set(), self.t1_hold())[0]
             if it["action"] == "exit":
                 self._once(c, "exit", f"⚠ {p['name']} 有 {need:g} 股没有保护，而且{it['why']}：没有自动卖出，"
                                       "请到「持仓 · 风险」点「一键挂保护单」确认离场，或在 moomoo 里自己处理")
@@ -638,7 +649,8 @@ class Engine:
                     continue
                 with self.lock:
                     specs = it["specs"]
-                    _, notes = self.bm.create(specs[0], specs[1] if len(specs) > 1 else None, "REAL")
+                    _, notes = self.bm.create(specs[0], specs[1] if len(specs) > 1 else None, "REAL",
+                                              server_target=not self._cash())
                     save(self.cfg)
                 self._unprot.pop(c, None)
                 created = True

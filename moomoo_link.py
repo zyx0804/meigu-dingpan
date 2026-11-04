@@ -32,6 +32,7 @@ class MoomooLink:
         self.quote = None
         self.acc_id = None
         self.acc_ids = {}  # "REAL" / "SIMULATE" -> 账户 ID
+        self.acc_type = None  # 真实账户类型：CASH 现金账户 / MARGIN 融资账户
 
     def connect(self):
         from moomoo import OpenQuoteContext, OpenSecTradeContext, RET_OK, SecurityFirm, TrdEnv, TrdMarket
@@ -45,6 +46,7 @@ class MoomooLink:
         if real.empty:
             raise RuntimeError("没有找到美股真实账户（OpenD 是否已登录？）")
         self.acc_id = int(real.iloc[0]["acc_id"])
+        self.acc_type = str(real.iloc[0].get("acc_type", ""))
         sim = accs[accs["trd_env"] == TrdEnv.SIMULATE]
         self.acc_ids = {"REAL": self.acc_id}
         if not sim.empty:
@@ -90,7 +92,8 @@ class MoomooLink:
             short = str(r.get("position_side", "")).upper() == "SHORT" or qty < 0
             out.append({"code": to_local(r["code"]), "name": r["stock_name"], "qty": abs(qty),
                         "cost": cost, "price": float(r["nominal_price"]),
-                        "market_val": float(r["market_val"]), "side": "short" if short else "long"})
+                        "market_val": float(r["market_val"]), "side": "short" if short else "long",
+                        "today_buy": float(r.get("today_buy_qty", 0) or 0)})
         return out
 
     def snapshot(self, codes):

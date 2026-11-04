@@ -15,6 +15,7 @@ def rules_text(params=None):
         "价格已经跌破动态止损（做空为涨破）或已到止盈的持仓：不再挂保护单，按规则立即限价离场",
         "风险分 ≥ 70 但价格没破动态止损：照常挂保护单；是否提前离场由你勾选（默认不勾）",
         "所有单只在美股常规交易时段触发；数量不超过可卖数量",
+        "现金账户 T+1：当天买入的股票当天不止盈卖出（防止用未交收资金买的股票当天卖出而违规），止损照常有效",
     ]
 
 
@@ -91,8 +92,9 @@ def buy_plan(code, quote, rows, acct, held_qty, buy_cfg, params=None, pending_co
     return out
 
 
-def plan(positions, reports, active_codes):
-    """返回每只持仓的计划动作列表。active_codes：已有运行中规则的代码。"""
+def plan(positions, reports, active_codes, t1=()):
+    """返回每只持仓的计划动作列表。active_codes：已有运行中规则的代码；
+    t1：今天不能止盈卖出的代码（现金账户当天买入的）——到了止盈也只挂保护单，不离场。"""
     items = []
     for p in positions:
         c, r = p["code"], reports.get(p["code"])
@@ -105,7 +107,7 @@ def plan(positions, reports, active_codes):
             price = r["price"]
             broke = any(s.startswith(("跌破动态止损", "涨破动态止损")) for s in r["exit_signals"])
             tp = r.get("take_profit")
-            hit = tp and any(s.startswith("到达止盈") for s in r["exit_signals"])
+            hit = tp and any(s.startswith("到达止盈") for s in r["exit_signals"]) and c not in t1
             if broke or hit:
                 s, e = orders.build(p, price, "exit", price, p["qty"])
                 why = f"已破动态止损 {r['trail_stop']:.2f}" if broke else f"已到止盈 {tp:.2f}"
@@ -113,6 +115,8 @@ def plan(positions, reports, active_codes):
             else:
                 st, e = orders.build(p, price, "stop", round(r["trail_stop"], 2), p["qty"])
                 tg, e2 = orders.build(p, price, "target", round(tp, 2), p["qty"]) if tp else (None, None)
+                if c in t1 and e2:  # 当天买入且现价已过止盈：止盈留给程序盯价，明天再卖
+                    tg, e2 = None, None
                 loss = r["stop_loss_usd"]
                 item.update(action="protect", specs=[x for x in (st, tg) if x] if st else [], error=e or e2, why=(
                     f"止损 {r['trail_stop']:.2f}（阶段：{r['stop_stage']}），"

@@ -19,8 +19,9 @@ class BracketManager:
         """store：持久化的规则列表（存在 stocks.json 里）；log(msg)：写日志。"""
         self.desk, self.store, self.log = desk, store, log
 
-    def create(self, stop_spec, target_spec, env):
+    def create(self, stop_spec, target_spec, env, server_target=True):
         """先挂止损，再尝试挂止盈（target_spec 可以为 None：只有止损，程序负责自动跟踪）。
+        server_target=False：止盈不挂到服务器，直接由程序盯价（现金账户用：服务器止盈单可能在资金交收前成交而违规）。
         返回 (规则, 结果说明列表)。"""
         notes = []
         stop_id = self.desk.place(stop_spec, env)
@@ -31,7 +32,10 @@ class BracketManager:
              "status": "active", "ratchet": True, "created": time.strftime("%Y-%m-%d %H:%M")}
         if stop_spec["order_type"] in ("STOP", "STOP_LIMIT"):
             notes.append("· 固定止损会跟着动态止损自动上调（只升不降），每次调整都写进日志")
-        if target_spec:
+        if target_spec and not server_target:
+            b["mode"] = "local"
+            notes.append(f"止盈 {b['target']} 由程序盯价（现金账户：当天买入的股票第二个交易日才会止盈卖出，T+1）")
+        elif target_spec:
             try:
                 b["target_id"] = self.desk.place(target_spec, env)
                 notes.append(f"✓ 止盈也挂到了服务器，订单号 {b['target_id']}；一边成交后程序会撤掉另一边")
@@ -54,11 +58,12 @@ class BracketManager:
         b["status"] = "cancelled"
         self.log(f"规则 {b['id']} 已手动停止，相关挂单已撤")
 
-    def tick(self, prices, held, dyn_stops=None, targets=None, rth=True):
+    def tick(self, prices, held, dyn_stops=None, targets=None, rth=True, hold=()):
         """后台定时调用。prices：代码(usXXX) -> 现价；held(env, usXXX) -> 持仓数；
         dyn_stops：代码 -> 程序算出的动态止损价，用来自动上调固定止损单；
         targets：代码 -> 按当前规则算出的止盈价（程序盯价的规则会跟着更新，没有止盈的会补上）；
-        rth：是否在常规交易时段。盘前盘后、夜盘不触发止盈（不在那时撤掉止损）。"""
+        rth：是否在常规交易时段。盘前盘后、夜盘不触发止盈（不在那时撤掉止损）；
+        hold：今天不能止盈卖出的代码（现金账户当天买入的，T+1）。止损单在服务器上，不受影响。"""
         for b in [x for x in self.store if x["status"] == "active"]:
             try:
                 local = "us" + b["code"].split(".", 1)[1]
@@ -69,7 +74,7 @@ class BracketManager:
                         if not b["target"]:
                             self.log(f"规则 {b['id']} 按当前规则补上止盈 {tp}（程序盯价）")
                         b.update(target=tp, mode="local")
-                self._tick_one(b, prices, held, rth)
+                self._tick_one(b, prices, held, rth, local in hold)
                 if b["status"] == "active" and b.get("ratchet", True) and dyn_stops:
                     self._ratchet(b, prices, dyn_stops)
             except Exception as e:
@@ -98,7 +103,7 @@ class BracketManager:
         b["ratchets"] = b.get("ratchets", 0) + 1
         self.log(f"规则 {b['id']} 自动跟踪：止损从 {cur} {'上调' if long else '下调'}到 {new}（现价 {px}）")
 
-    def _tick_one(self, b, prices, held, rth=True):
+    def _tick_one(self, b, prices, held, rth=True, t1=False):
         env, local = b["env"], "us" + b["code"].split(".", 1)[1]
         stop_st = self.desk.order_status(b["stop_id"], env)
         tgt_st = self.desk.order_status(b["target_id"], env) if b["target_id"] else None
@@ -136,7 +141,13 @@ class BracketManager:
         if b["mode"] == "local" and b["target"] and rth:
             px = prices.get(local)
             long = b["side"] == "SELL"
-            if px and (px >= b["target"] if long else px <= b["target"]):
+            if px and (px >= b["target"] if long else px <= b["target"]) and t1:
+                today = time.strftime("%Y-%m-%d")
+                if b.get("t1_note") != today:
+                    b["t1_note"] = today
+                    self.log(f"规则 {b['id']} 价格 {px} 已到止盈 {b['target']}，但这只今天刚买（现金账户 T+1），"
+                             "下个交易日还在止盈价以上再卖；止损照常有效")
+            elif px and (px >= b["target"] if long else px <= b["target"]):
                 # 先撤止损，确认撤掉了再卖，避免两边都成交
                 self.desk.cancel(b["stop_id"], env)
                 if self.desk.order_status(b["stop_id"], env) not in DEAD:
