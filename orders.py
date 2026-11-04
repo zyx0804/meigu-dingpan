@@ -9,17 +9,21 @@
 
 import time
 
+MIN_FRAC_USD = 1.0  # moomoo 碎股单笔最低金额
 ACTIVE = {"UNSUBMITTED", "WAITING_SUBMIT", "SUBMITTING", "SUBMITTED", "FILLED_PART"}
 
 
 def build_buy(code, limit, qty):
     """买入单：限价、当日有效、只在常规交易时段。开仓只能走这里，并且必须先通过 rules.buy_plan 的检查。"""
-    qty = int(qty)
+    qty = round(float(qty), 4)
+    qty = int(qty) if qty.is_integer() else qty
     limit = round(float(limit), 2)
-    if qty < 1:
-        return None, "数量至少 1 股"
     if limit <= 0:
         return None, "价格必须大于 0"
+    if qty <= 0:
+        return None, "数量必须大于 0"
+    if not float(qty).is_integer() and qty * limit < MIN_FRAC_USD:
+        return None, f"碎股单笔金额至少 ${MIN_FRAC_USD:g}"
     return {"order_type": "NORMAL", "aux_price": None, "price": limit, "code": "US." + code[2:], "qty": qty,
             "trd_side": "BUY", "kind": "buy", "time_in_force": "DAY", "session": "RTH"}, None
 

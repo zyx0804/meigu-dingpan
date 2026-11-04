@@ -48,6 +48,19 @@ class BracketManager:
         self.log(f"建立规则 {b['id']} {b['code']} {b['qty']} 股：止损单 {stop_id}，{tgt}")
         return b, notes
 
+    def create_local(self, stop_spec, target_spec, env):
+        """碎股：moomoo 不支持给碎股挂止损单，止损和止盈都由程序盯价，到价时限价卖出。不在服务器上挂任何单。"""
+        b = {"id": f"R{time.strftime('%m%d%H%M%S')}-{len(self.store) + 1}", "env": env, "code": stop_spec["code"],
+             "qty": stop_spec["qty"], "side": stop_spec["trd_side"], "stop_id": None, "stop_local": True,
+             "stop_desc": stop_spec, "target": target_spec["price"] if target_spec else None, "target_id": None,
+             "mode": "local", "status": "active", "ratchet": True, "created": time.strftime("%Y-%m-%d %H:%M")}
+        self.store.append(b)
+        tgt = f"止盈 {b['target']}" if b["target"] else "无止盈"
+        note = (f"碎股 {b['qty']:g} 股：moomoo 不支持碎股止损单，止损 {stop_spec['aux_price']}、{tgt} 都由程序盯价，"
+                "常规时段到价就限价卖出（这部分需要程序和 OpenD 开着）")
+        self.log(f"建立规则 {b['id']} {b['code']} {note}")
+        return b, [note]
+
     def cancel_rule(self, b):
         for oid in (b["stop_id"], b["target_id"]):
             if oid:
@@ -84,7 +97,7 @@ class BracketManager:
         """固定止损单跟着动态止损往有利方向移：做多只上调、做空只下调，永远不放宽。
         跟踪止损单由 moomoo 服务器自己跟踪，不需要改。"""
         sd = b["stop_desc"]
-        if sd["order_type"] not in ("STOP", "STOP_LIMIT") or b.get("phase") == "selling":
+        if sd["order_type"] not in ("STOP", "STOP_LIMIT") or b.get("phase") in ("selling", "stopping"):
             return
         local = "us" + b["code"].split(".", 1)[1]
         new, px = dyn_stops.get(local), prices.get(local)
@@ -98,12 +111,52 @@ class BracketManager:
             return
         new = round(new, 2)
         limit = round(new * (0.99 if long else 1.01), 2) if sd["order_type"] == "STOP_LIMIT" else new
-        self.desk.modify_stop(b["stop_id"], b["env"], b["qty"], new, limit)
+        if not b.get("stop_local"):  # 程序盯价的止损只改记下来的价格，不用改单
+            self.desk.modify_stop(b["stop_id"], b["env"], b["qty"], new, limit)
         sd.update(aux_price=new, price=limit)
         b["ratchets"] = b.get("ratchets", 0) + 1
         self.log(f"规则 {b['id']} 自动跟踪：止损从 {cur} {'上调' if long else '下调'}到 {new}（现价 {px}）")
 
+    def _tick_local(self, b, prices, held, rth, t1):
+        """程序盯价的止损 + 止盈（碎股）：常规时段到价就挂可立即成交的限价卖单；没成交就下一轮再挂。"""
+        env, local = b["env"], "us" + b["code"].split(".", 1)[1]
+        phase = b.get("phase")
+        if phase in ("stopping", "selling"):
+            st = self.desk.order_status(b["exit_id"], env)
+            what = "止损" if phase == "stopping" else "止盈"
+            if st in DONE:
+                b["status"] = "done"
+                self.log(f"规则 {b['id']} 程序{what}卖单已成交，规则结束", alert=True)
+            elif st in DEAD:
+                b.update(phase=None, exit_id=None)
+                self.log(f"规则 {b['id']} 程序{what}卖单没成交（{st}），继续盯价", alert=True)
+            return
+        if held(env, local) <= 0:
+            b["status"] = "done"
+            self.log(f"规则 {b['id']} {b['code']} 已无持仓，规则结束", alert=True)
+            return
+        px = prices.get(local)
+        if not px or not rth:
+            return
+        long = b["side"] == "SELL"
+        stop = b["stop_desc"]["aux_price"]
+        if px <= stop if long else px >= stop:
+            phase, why = "stopping", f"跌破止损 {stop}" if long else f"涨破止损 {stop}"
+        elif b["target"] and not t1 and (px >= b["target"] if long else px <= b["target"]):
+            phase, why = "selling", f"到达止盈 {b['target']}"
+        else:
+            return
+        limit = round(px * (0.995 if long else 1.005), 2)
+        spec = {"order_type": "NORMAL", "aux_price": None, "price": limit, "code": b["code"], "qty": b["qty"],
+                "trd_side": b["side"], "kind": "exit" if phase == "stopping" else "target", "time_in_force": "DAY",
+                "session": "RTH"}
+        b["exit_id"] = self.desk.place(spec, env)
+        b["phase"] = phase
+        self.log(f"规则 {b['id']} 价格 {px} {why}：限价 {limit} 卖出 {b['qty']:g} 股，订单号 {b['exit_id']}", alert=True)
+
     def _tick_one(self, b, prices, held, rth=True, t1=False):
+        if b.get("stop_local"):
+            return self._tick_local(b, prices, held, rth, t1)
         env, local = b["env"], "us" + b["code"].split(".", 1)[1]
         stop_st = self.desk.order_status(b["stop_id"], env)
         tgt_st = self.desk.order_status(b["target_id"], env) if b["target_id"] else None
