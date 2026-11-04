@@ -91,7 +91,7 @@ function render(force){
   $("conn").className="dot "+(S.connected?"ok":"bad");$("conn").textContent="● "+(S.connected?"已连接 moomoo":S.acc_status.split("：")[0]);
   $("autoscr").checked=S.settings.auto_screen;
   $("log").innerHTML=`<span class="sub">${esc(S.updated)} · 每秒刷新 · 版本 ${esc(S.version)}</span><br>`+S.logs.map(esc).join("<br>");
-  const u=S.update;if(u&&u.available){$("upd").style.display="block";$("upd").innerHTML=`发现新版本 <b>${esc(u.available)}</b>：${esc(u.notes||"")} <button class="acc" onclick="doUpdate()">立即更新</button>`}else $("upd").style.display="none";
+  const u=S.update;if(u&&u.available){$("upd").style.display="block";$("upd").innerHTML=`发现新版本 <b>${esc(u.available)}</b>：${esc(u.notes||"")} <button class="acc" onclick="doUpdate()">立即更新</button>${u.note?` <span class="sub">${esc(u.note)}</span>`:""}${u.error?` <span class="down">${esc(u.error)}</span>`:""}`}else $("upd").style.display="none";
   if(document.activeElement&&document.activeElement.closest&&document.activeElement.closest("#view")&&!force)return; // 正在输入时不重画
   ({watch:vWatch,pos:vPos,buy:vBuy,orders:vOrders,journal:vJournal})[tab]();
 }
@@ -132,7 +132,7 @@ function vPos(){
 function report(){const p=S.positions.find(x=>x.code===sel.p)||S.positions[0];if(!p)return;
   openM(`<h2>${esc(p.name)}（${esc(p.code)}） 风险等级：${esc(p.level||"-")}</h2><p>${p.qty} 股 · 成本 ${n(p.cost)} · 现价 ${n(p.price)} · 盈亏 <span class="${sgn(p.pl_pct)}">${n(p.pl_pct)}%</span></p>
   <div class="box"><h3>风险因素</h3><ul>${p.reasons.map(r=>`<li>${esc(r)}</li>`).join("")}</ul></div>
-  <div class="box"><h3>动态止损</h3>当前 ${n(p.trail_stop)}（阶段：${esc(p.stage||"-")}）· 打到止损${p.stop_loss_usd>0?"亏 "+money(p.stop_loss_usd):"仍赚 "+money(-p.stop_loss_usd)} · 最多亏 ${money(p.max_loss)}</div>
+  <div class="box"><h3>动态止损</h3>当前 ${n(p.trail_stop)}（阶段：${esc(p.stage||"-")}）· 打到止损${p.stop_loss_usd>0?"亏 "+money(p.stop_loss_usd):"仍赚 "+money(-p.stop_loss_usd)} · 最多亏 ${money(p.max_loss)}${p.take_profit?` · 止盈 ${n(p.take_profit)}（常规时段到价自动卖出）`:""}</div>
   <div class="box"><h3>如果价格变成…</h3><table><tr><th>情景</th><th>价格</th><th>相对现在</th><th>相对成本</th><th>占总资产</th></tr>${p.scenarios.map(s=>`<tr><td>${esc(s.label)}</td><td>${n(s.price)}</td><td class="${sgn(s.pnl_now)}">${money(s.pnl_now)}</td><td class="${sgn(s.pnl_cost)}">${money(s.pnl_cost)}</td><td>${n(s.pct_assets,1)}%</td></tr>`).join("")}</table></div>
   <button onclick="closeM()">关闭</button>`)}
 async function protect(){const pl=await api("/api/protect/plan");
@@ -159,7 +159,7 @@ async function buyPlanGo(){const c=$("bcode").value.trim();if(!c)return;sel.b=c;
   try{buyPlan=await api("/api/buy/plan?code="+encodeURIComponent(c));showBuy(buyPlan)}catch(e){$("bplan").innerHTML=`<p class="down">${esc(e.message)}</p>`}}
 function showBuy(p){const el=$("bplan");if(!el)return;
   el.innerHTML=`<div class="box"><h3>${esc(p.name)}（${esc(p.code)}） ${p.ok?'<span class="up">✓ 符合买入规则</span>':'<span class="down">✗ 不符合买入规则</span>'}</h3>
-  ${p.price?`<p>现价 ${n(p.price)} · 限价 <b>${n(p.limit)}</b> · 止损 <b>${n(p.stop)}</b>（${n(p.atr)} ATR）· 每股风险 ${money(p.per_share)}</p>`:""}
+  ${p.price?`<p>现价 ${n(p.price)} · 限价 <b>${n(p.limit)}</b> · 止损 <b>${n(p.stop)}</b> · 止盈 <b>${n(p.target)}</b>（ATR ${n(p.atr)}）· 每股风险 ${money(p.per_share)}</p>`:""}
   <ul>${p.checks.map(([t,ok])=>`<li class="${ok?"up":"down"}">${ok?"✓":"✗"} ${esc(t)}</li>`).join("")}</ul>
   ${p.reasons.length?`<p class="down">${p.reasons.map(esc).join("<br>")}</p>`:""}
   ${p.ok?`<p>规则上限 <b>${p.qty}</b> 股 · 约 ${money(p.cost)} · 打到止损最多亏 ${money(p.max_loss)}（${n(p.max_loss_pct)}% 总资产）</p>
@@ -168,7 +168,8 @@ function showBuy(p){const el=$("bplan");if(!el)return;
   <details><summary class="sub">买入规则</summary><ol>${p.rules.map(r=>`<li>${esc(r)}</li>`).join("")}</ol></details></div>`}
 async function buyGo(code,max){const q=parseInt($("bq").value);if(!(q>=1&&q<=max))return toast("股数要在 1~"+max+" 之间");
   if(!confirm(`在真实账户买入 ${code} ${q} 股（限价单，当日有效）？\n成交后会自动挂动态止损。\n\n需要先在 OpenD 里解锁交易。`))return;
-  const r=await act("/api/buy/execute",{code,qty:q,confirm:true});toast(r.result);buyPlan=null;render(true)}
+  const btn=event&&event.target;if(btn)btn.disabled=true;
+  try{const r=await act("/api/buy/execute",{code,qty:q,confirm:true});toast(r.result);buyPlan=null;render(true)}finally{if(btn)btn.disabled=false}}
 
 function vOrders(){
   $("view").innerHTML=`<div class="bar"><button onclick="cancelSel()">撤销选中</button><button onclick="cancelAll()">全部撤销</button><span class="sub">每 5 秒自动刷新 ${esc(S.order_note)}</span></div>
@@ -184,8 +185,8 @@ async function stopRule(){const r=S.rules.find(x=>x.id===sel.r);if(!r||!r.active
 let J=null,jT=0;
 async function vJournal(){if(!J||Date.now()-jT>15000){J=await api("/api/journal");jT=Date.now()}
   const j=J.journal||{},st=j.stats,rp=J.rule_params,sug=J.suggestion,b=j.base,bt=J.bt||{};
-  $("view").innerHTML=`<div class="box"><h3>当前规则 v${rp.version}${rp.since?"（"+esc(rp.since)+" 起）":""}</h3>相对成本最多亏 ${rp.loss_cap} ATR · 买入后最高点回撤 ${rp.trail} ATR 跟踪 · 浮盈 ${rp.breakeven} ATR 后保本
-   ${J.rule_history.slice().reverse().map(h=>`<br><span class="sub">历史 v${h.version}：限亏 ${h.loss_cap} / 跟踪 ${h.trail} / 保本 ${h.breakeven}（用到 ${esc(h.until)}）</span>`).join("")}
+  $("view").innerHTML=`<div class="box"><h3>当前规则 v${rp.version}${rp.since?"（"+esc(rp.since)+" 起）":""}</h3>相对成本最多亏 ${rp.loss_cap} ATR · 买入后最高点回撤 ${rp.trail} ATR 跟踪 · 浮盈 ${rp.breakeven} ATR 后保本 · 成本 + ${rp.target??"-"} ATR 止盈
+   ${J.rule_history.slice().reverse().map(h=>`<br><span class="sub">历史 v${h.version}：限亏 ${h.loss_cap} / 跟踪 ${h.trail} / 保本 ${h.breakeven} / 止盈 ${h.target??"无"}（用到 ${esc(h.until)}）</span>`).join("")}
    <div class="bar">${sug?`<button class="acc" onclick="if(confirm('采用新规则？已挂的止损只会按新规则往上调，不会被放宽。'))act('/api/rule/adopt').then(()=>{J=null;render(true)})">采用新规则</button>`:""}
    ${J.rule_history.length?`<button onclick="if(confirm('退回上一版？'))act('/api/rule/rollback').then(()=>{J=null;render(true)})">退回上一版</button>`:""}
    <button onclick="act('/api/backtest').then(()=>{toast('已开始分析，约 30~60 秒');J=null})" ${S.backtesting?"disabled":""}>${S.backtesting?"分析中…":"立即分析"}</button></div></div>
@@ -194,9 +195,9 @@ async function vJournal(){if(!J||Date.now()-jT>15000){J=await api("/api/journal"
    ${(j.trades||[]).slice(-10).map(t=>`<br><span class="${sgn(t.pnl)}">${esc(t.entry_time.slice(0,10))} → ${esc(t.exit_time.slice(0,10))} ${esc(t.name)} ${t.qty} 股 ${n(t.entry)} → ${n(t.exit)} ${n(t.ret*100,1)}%（${esc(t.how||"手动")}）</span>`).join("")}`:"还没有已平仓的交易"}
    ${Object.values(j.open||{}).flat().map(l=>`<br>持仓中：${esc(l.name)} ${l.qty} 股，${esc(l.time.slice(0,10))} 以 ${n(l.price)} 买入`).join("")}</div>
   <div class="box"><h3>复盘发现</h3><ul>${(j.insights||["还没有复盘数据，点「立即分析」"]).map(x=>`<li>${esc(x)}</li>`).join("")}</ul></div>
-  <div class="box"><h3>规则进化</h3>${b?`评估样本：候选池回测 ${b.trades} 笔 + 你的真实买入 ${j.entries} 次；你的交易权重 ${n(j.weight*100,0)}%（已平仓 20 笔后为 100%）
-   <br>当前规则：平均每笔 ${n(b.avg)}% · 最差一笔 ${n(b.worst,1)}% · 最大回撤 ${n(b.mdd,1)}%${b.user_avg!=null?` · 按你的买入复盘 ${n(b.user_avg)}%`:""}
-   ${sug?`<br><span class="up">建议：限亏 ${sug.params.loss_cap} / 跟踪 ${sug.params.trail} / 保本 ${sug.params.breakeven} ATR → 平均每笔 ${n(sug.avg)}% · 最差一笔 ${n(sug.worst,1)}% · 最大回撤 ${n(sug.mdd,1)}%</span><br><span class="sub">已通过护栏：收益更高、最差一笔不更差、回撤不更高、前后两段分开测都不更差</span>`:"<br>目前没有在所有护栏下都更好的参数"}`:"还没有分析结果"}</div>
+  <div class="box"><h3>规则进化 <span class="sub">每月第一个交易日收盘后自动评估，通过全部护栏就自动换新规则${J.rule_month?"；上次评估 "+esc(J.rule_month):""}</span></h3>${j.tune_result?`<b>${esc(j.tune_result)}</b><br>`:""}${b?`上次评估样本：候选池回测 ${b.trades} 笔 + 你的真实买入 ${j.entries} 次；你的交易权重 ${n(j.weight*100,0)}%（已平仓 20 笔后为 100%）
+   <br>评估时的规则：平均每笔 ${n(b.avg)}% · 最差一笔 ${n(b.worst,1)}% · 最大回撤 ${n(b.mdd,1)}%${b.user_avg!=null?` · 按你的买入复盘 ${n(b.user_avg)}%`:""}
+   ${sug?`<br><span class="up">建议：限亏 ${sug.params.loss_cap} / 跟踪 ${sug.params.trail} / 保本 ${sug.params.breakeven} / 止盈 ${sug.params.target} ATR → 平均每笔 ${n(sug.avg)}% · 最差一笔 ${n(sug.worst,1)}% · 最大回撤 ${n(sug.mdd,1)}%</span><br><span class="sub">已通过护栏：收益更高、最差一笔不更差、回撤不更高、前后两段分开测都不更差</span>`:"<br>目前没有在所有护栏下都更好的参数"}`:"还没有月度评估结果"}</div>
   ${bt.results?`<div class="box"><h3>离场规则回测（${esc(bt.date)}，${bt.stocks} 只股票、近 2 年）</h3><div class="tbl"><table><tr><th>规则</th><th>笔数</th><th>胜率</th><th>平均每笔</th><th>累计</th><th>最大回撤</th><th>最差一笔</th></tr>
    ${bt.results.map(r=>`<tr><td>${esc(r.name)}</td><td>${r.trades}</td><td>${n(r.win,0)}%</td><td class="${sgn(r.avg)}">${n(r.avg)}%</td><td>${n(r.total,1)}%</td><td>${n(r.mdd,1)}%</td><td>${n(r.worst,1)}%</td></tr>`).join("")}</table></div><p class="sub">历史表现不代表未来。</p></div>`:""}`}
 render();poll();

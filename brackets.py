@@ -54,12 +54,22 @@ class BracketManager:
         b["status"] = "cancelled"
         self.log(f"规则 {b['id']} 已手动停止，相关挂单已撤")
 
-    def tick(self, prices, held, dyn_stops=None):
+    def tick(self, prices, held, dyn_stops=None, targets=None, rth=True):
         """后台定时调用。prices：代码(usXXX) -> 现价；held(env, usXXX) -> 持仓数；
-        dyn_stops：代码 -> 程序算出的动态止损价，用来自动上调固定止损单。"""
+        dyn_stops：代码 -> 程序算出的动态止损价，用来自动上调固定止损单；
+        targets：代码 -> 按当前规则算出的止盈价（程序盯价的规则会跟着更新，没有止盈的会补上）；
+        rth：是否在常规交易时段。盘前盘后、夜盘不触发止盈（不在那时撤掉止损）。"""
         for b in [x for x in self.store if x["status"] == "active"]:
             try:
-                self._tick_one(b, prices, held)
+                local = "us" + b["code"].split(".", 1)[1]
+                tp = (targets or {}).get(local)
+                if tp and b.get("phase") != "selling" and (b["mode"] == "local" or not b["target"]):
+                    tp = round(tp, 2)
+                    if b["target"] != tp:
+                        if not b["target"]:
+                            self.log(f"规则 {b['id']} 按当前规则补上止盈 {tp}（程序盯价）")
+                        b.update(target=tp, mode="local")
+                self._tick_one(b, prices, held, rth)
                 if b["status"] == "active" and b.get("ratchet", True) and dyn_stops:
                     self._ratchet(b, prices, dyn_stops)
             except Exception as e:
@@ -88,7 +98,7 @@ class BracketManager:
         b["ratchets"] = b.get("ratchets", 0) + 1
         self.log(f"规则 {b['id']} 自动跟踪：止损从 {cur} {'上调' if long else '下调'}到 {new}（现价 {px}）")
 
-    def _tick_one(self, b, prices, held):
+    def _tick_one(self, b, prices, held, rth=True):
         env, local = b["env"], "us" + b["code"].split(".", 1)[1]
         stop_st = self.desk.order_status(b["stop_id"], env)
         tgt_st = self.desk.order_status(b["target_id"], env) if b["target_id"] else None
@@ -123,7 +133,7 @@ class BracketManager:
             self.log(f"规则 {b['id']} 的止损单状态为 {stop_st}（可能被你在 moomoo 里撤了），规则结束")
             return
 
-        if b["mode"] == "local" and b["target"]:
+        if b["mode"] == "local" and b["target"] and rth:
             px = prices.get(local)
             long = b["side"] == "SELL"
             if px and (px >= b["target"] if long else px <= b["target"]):

@@ -11,8 +11,8 @@ def rules_text(params=None):
         f"动态止损 = 三条取最有利：相对成本最多亏 {p['loss_cap']:g} ATR；买入后最高点回撤 {p['trail']:g} ATR 跟踪；"
         f"浮盈 {p['breakeven']:g} ATR 后保本",
         "止损单挂在 moomoo 服务器（关机也触发），程序每秒对照动态止损，只往有利方向自动改单，永不放宽",
-        "不设固定止盈：盈利靠止损线跟着上移锁定（回测中这样最差一笔亏损最小、回撤最低）",
-        "价格已经跌破动态止损（做空为涨破）的持仓：不再挂保护单，按规则立即限价离场",
+        f"止盈 = 成本 + {p['target']:g} ATR：常规交易时段价格到了，程序先撤止损、再限价全部卖出（需要程序和 OpenD 开着）",
+        "价格已经跌破动态止损（做空为涨破）或已到止盈的持仓：不再挂保护单，按规则立即限价离场",
         "风险分 ≥ 70 但价格没破动态止损：照常挂保护单；是否提前离场由你勾选（默认不勾）",
         "所有单只在美股常规交易时段触发；数量不超过可卖数量",
     ]
@@ -26,7 +26,7 @@ def buy_rules_text(buy_cfg, params=None):
     return [
         "只买美股个股（不买指数），只用限价单，当日有效，只在常规交易时段成交",
         "趋势条件：收盘价站上 20 日均线，并且近 20 个交易日是上涨的；不满足就不允许买",
-        f"止损先定好再买：止损价 = 买入价 − {p['loss_cap']:g} ATR（和持仓的动态止损同一套规则）",
+        f"止损先定好再买：止损价 = 买入价 − {p['loss_cap']:g} ATR；止盈 = 买入价 + {p['target']:g} ATR（和持仓同一套规则）",
         f"股数 = 以下三者取最小：打到止损最多亏总资产 {buy_cfg['risk_pct']:g}%；"
         f"这只股票市值不超过总资产 {buy_cfg['max_pos_pct']:g}%（含已持有部分）；不超过购买力",
         "算出来不足 1 股就不买，并告诉你差多少",
@@ -50,6 +50,7 @@ def buy_plan(code, quote, rows, acct, held_qty, buy_cfg, params=None, pending_co
     a = risk.atr(rows)
     limit = round(price * 1.002, 2)  # 比现价高 0.2% 的限价，基本能成交又不会追太高
     stop = round(limit - p["loss_cap"] * a, 2)
+    target = round(limit + p["target"] * a, 2)
     per_share = limit - stop
     total = (acct or {}).get("total_assets") or 0
     power = (acct or {}).get("power") or 0
@@ -84,7 +85,7 @@ def buy_plan(code, quote, rows, acct, held_qty, buy_cfg, params=None, pending_co
         if by_cash < 1:
             need.append(f"购买力不够：1 股需要 ${limit:,.2f}")
         out["reasons"].append("算出来不足 1 股：" + "；".join(need))
-    out.update(price=price, limit=limit, stop=stop, atr=a, qty=qty, per_share=per_share,
+    out.update(price=price, limit=limit, stop=stop, target=target, atr=a, qty=qty, per_share=per_share,
                cost=qty * limit, max_loss=qty * per_share, max_loss_pct=qty * per_share / total * 100 if total else None)
     out["ok"] = not out["reasons"]
     return out
@@ -103,17 +104,21 @@ def plan(positions, reports, active_codes):
         else:
             price = r["price"]
             broke = any(s.startswith(("跌破动态止损", "涨破动态止损")) for s in r["exit_signals"])
-            if broke:
+            tp = r.get("take_profit")
+            hit = tp and any(s.startswith("到达止盈") for s in r["exit_signals"])
+            if broke or hit:
                 s, e = orders.build(p, price, "exit", price, p["qty"])
-                item.update(action="exit", why=f"已破动态止损 {r['trail_stop']:.2f}", specs=[s] if s else [],
-                            error=e)
+                why = f"已破动态止损 {r['trail_stop']:.2f}" if broke else f"已到止盈 {tp:.2f}"
+                item.update(action="exit", why=why, specs=[s] if s else [], error=e)
             else:
                 st, e = orders.build(p, price, "stop", round(r["trail_stop"], 2), p["qty"])
+                tg, e2 = orders.build(p, price, "target", round(tp, 2), p["qty"]) if tp else (None, None)
                 loss = r["stop_loss_usd"]
-                item.update(action="protect", specs=[st] if st else [], error=e, why=(
+                item.update(action="protect", specs=[x for x in (st, tg) if x] if st else [], error=e or e2, why=(
                     f"止损 {r['trail_stop']:.2f}（阶段：{r['stop_stage']}），"
                     + (f"打到止损亏 ${loss:,.2f}" if loss > 0 else f"打到止损仍赚 ${-loss:,.2f}")
-                    + f"；最多亏 ${r['max_loss']:,.2f}，之后程序每秒自动上调"))
+                    + f"；最多亏 ${r['max_loss']:,.2f}，之后程序每秒自动上调"
+                    + (f"；止盈 {tp:.2f}" if tp else "")))
                 if r["risk_score"] is not None and r["risk_score"] >= 70:
                     ex, _ = orders.build(p, price, "exit", price, p["qty"])
                     item["optional_exit"] = ex

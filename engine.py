@@ -16,7 +16,7 @@ import risk
 import rules
 import screener
 import tuner
-from common import DATA, ENV_NAME, INDICES, fetch, fetch_daily, load, normalize, save
+from common import DATA, ENV_NAME, INDICES, fetch, fetch_daily, last_session, load, market_open, normalize, save, us_date
 from moomoo_link import MoomooLink, opend_running
 
 STATUS_NAME = {"active": "运行中", "done": "已结束", "cancelled": "已停止"}
@@ -26,6 +26,8 @@ class Engine:
     def __init__(self):
         self.cfg = load()
         self.lock = threading.RLock()  # 网页请求线程和后台线程共用配置，改动时加锁
+        # 下单类操作一次只做一笔：连点两次或开两个网页时，第二次要等第一次下完、记好账再重新检查，不会重复下单
+        self.trade_lock = threading.Lock()
         self.quotes, self.hist, self.reports = {}, {}, {}
         self.fired = {}
         self.link = MoomooLink()
@@ -129,7 +131,7 @@ class Engine:
         self.order_rows, self.order_note = rows, "；".join(notes)
 
     def update_hist(self):
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = us_date()
         for p in self.positions:
             c = p["code"]
             if self.hist.get(c, (None,))[0] == today or "symbol" not in self.quotes.get(c, {}):
@@ -153,7 +155,7 @@ class Engine:
                             entry_date=journal.entry_date(self.cfg["journal"].get("open", {}), c))
             r.update(code=c, name=p["name"], price=price, pos=p)
             reports[c] = r
-            today = datetime.now().strftime("%Y-%m-%d")
+            today = us_date()
             for sig in r["exit_signals"]:
                 key = (c, "exit:" + sig.split(" ")[0])
                 if self.fired.get(key) != today:
@@ -166,15 +168,16 @@ class Engine:
             return
         prices = {c: d.get("price") for c, d in self.quotes.items()}
         dyn = {c: r["trail_stop"] for c, r in self.reports.items() if r.get("trail_stop")}
+        tps = {c: r["take_profit"] for c, r in self.reports.items() if r.get("take_profit")}
         with self.lock:
             before = json.dumps(self.cfg["brackets"], sort_keys=True, default=str)
-            self.bm.tick(prices, self.desk.position_qty, dyn)
+            self.bm.tick(prices, self.desk.position_qty, dyn, tps, market_open())
             if json.dumps(self.cfg["brackets"], sort_keys=True, default=str) != before:
                 save(self.cfg)
 
     # ---------- 到价提醒 ----------
     def check_alerts(self):
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = us_date()
         for code, a in list(self.cfg["alerts"].items()):
             d = self.quotes.get(code)
             if not d:
@@ -245,8 +248,8 @@ class Engine:
 
     # ---------- 选股 ----------
     def start_screen(self, force=False):
-        today = datetime.now().strftime("%Y-%m-%d")
-        if self.screening or not (force or (self.cfg["auto_screen"] and self.cfg["screen_date"] != today)):
+        # 按「最近一个已收盘的交易日」判断：盘中不会用没收完的 K 线去清除自选
+        if self.screening or not (force or (self.cfg["auto_screen"] and self.cfg["screen_date"] != last_session())):
             return
         self.screening = True
         threading.Thread(target=self._screen, daemon=True).start()
@@ -268,7 +271,7 @@ class Engine:
             self.screening = False
 
     def _apply_screen(self, ranked):
-        today = datetime.now()
+        today, session = datetime.now(), last_session()
         with self.lock:
             cutoff = today.toordinal() - 7
             self.cfg["ignore"] = {c: d for c, d in self.cfg["ignore"].items()
@@ -286,11 +289,11 @@ class Engine:
                     self.cfg["stocks"].append(c)
             self.cfg["screen"] = {x["code"]: {"score": x["score"], "rank": x["rank"], "reason": x["reason"],
                                               "name": x["name"], "eligible": x["eligible"]} for x in ranked}
-            self.cfg["screen_date"] = today.strftime("%Y-%m-%d")
+            self.cfg["screen_date"] = session
             save(self.cfg)
         by = {x["code"]: x for x in ranked}
         name = lambda c: by.get(c, {}).get("name", c)
-        with open(os.path.join(DATA, f"screen_{today:%Y-%m-%d}.csv"), "w", encoding="utf-8-sig") as f:
+        with open(os.path.join(DATA, f"screen_{session}.csv"), "w", encoding="utf-8-sig") as f:
             f.write("排名,代码,名称,评分,符合条件,理由,本次操作\n")
             for x in ranked:
                 f.write(f"{x['rank']},{x['code']},{x['name']},{x['score']},{'是' if x['eligible'] else '否'},"
@@ -302,7 +305,7 @@ class Engine:
 
     # ---------- 回测 + 复盘 + 规则进化（每天一次） ----------
     def start_backtest(self, force=False):
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = last_session()
         if self.backtesting or not (force or self.cfg["bt"].get("date") != today):
             return
         self.backtesting = True
@@ -347,42 +350,64 @@ class Engine:
         entries = [(data[t["code"]], t["entry_time"][:10], t["entry"]) for t in closed if t["code"] in data]
         entries += [(data[c], lot["time"][:10], lot["price"]) for c, lots in open_lots.items() if c in data
                     for lot in lots]
-        cur = {k: self.cfg["rule_params"][k] for k in ("loss_cap", "trail", "breakeven")}
-        base, best, cands, w = tuner.suggest(cur, data, entries, len(closed))
+        cur = {k: self.cfg["rule_params"][k] for k in tuner.KEYS}
+        month = last_session()[:7]
+        # 交易规则每月评估一次（每月第一个交易日收盘后），盘中不换规则；复盘统计照常每天更新
+        tune = self.cfg.get("rule_month") != month and not market_open(10)
+        base, best, cands, w = tuner.suggest(cur, data, entries, len(closed)) if tune else (None, None, [], None)
         brief = lambda ev: ev and {"params": ev["params"], "avg": ev["pooled"]["avg"], "worst": ev["pooled"]["worst"],
                                    "mdd": ev["pooled"]["mdd"], "trades": ev["pooled"]["trades"],
                                    "user_avg": ev["user_avg"], "score": ev["score"]}
         with self.lock:
+            old = self.cfg["journal"]
             self.cfg["journal"] = {"date": datetime.now().strftime("%Y-%m-%d"), "trades": closed, "stats": st,
                                    "insights": journal.insights(closed, st), "open": open_lots, "deals": len(deals),
-                                   "base": brief(base), "weight": w, "entries": len(entries)}
+                                   "base": brief(base) if tune else old.get("base"),
+                                   "weight": w if tune else old.get("weight"), "entries": len(entries),
+                                   "tune_result": old.get("tune_result")}
+            if not tune:
+                save(self.cfg)
+                return
+            self.cfg["rule_month"] = month
             b = brief(best)
-            self.cfg["suggestion"] = b if b and b["params"] != cur else None
-            save(self.cfg)
-        if self.cfg["suggestion"]:
-            p = self.cfg["suggestion"]["params"]
-            self.log(f"规则进化：发现更好的参数（限亏 {p['loss_cap']:g} / 跟踪 {p['trail']:g} / 保本 {p['breakeven']:g} ATR），"
-                     "到「复盘」页查看，点「采用」才会生效")
+            if b and b["params"] != cur:
+                p = b["params"]
+                self.cfg["journal"]["tune_result"] = (f"{month}：已自动换成 限亏 {p['loss_cap']:g} / 跟踪 {p['trail']:g} / "
+                                                      f"保本 {p['breakeven']:g} / 止盈 {p['target']:g} ATR（平均每笔 {b['avg']:.2f}%，"
+                                                      f"最差一笔 {b['worst']:.1f}%，最大回撤 {b['mdd']:.1f}%）")
+                self._adopt(b, f"{month} 月度规则评估自动采用")
+                self.log(f"月度规则更新：换成 限亏 {p['loss_cap']:g} / 跟踪 {p['trail']:g} / 保本 {p['breakeven']:g} / "
+                         f"止盈 {p['target']:g} ATR"
+                         f"（v{self.cfg['rule_params']['version']}），不满意可在「复盘」页退回上一版", alert=True)
+            else:
+                self.cfg["suggestion"] = None
+                self.cfg["journal"]["tune_result"] = f"{month}：没有在所有护栏下都更好的参数，规则保持不变"
+                save(self.cfg)
+                self.log(f"{month} 月度规则评估：没有通过全部护栏的更好参数，规则保持 v{self.cfg['rule_params']['version']} 不变")
 
     def adopt_suggestion(self):
         with self.lock:
             sug = self.cfg["suggestion"]
             if not sug:
                 raise ValueError("没有待采用的建议")
+            self._adopt(sug, "手动采用")
+
+    def _adopt(self, sug, how):
+        with self.lock:
             old = dict(self.cfg["rule_params"])
             self.cfg["rule_history"].append({**old, "until": datetime.now().strftime("%Y-%m-%d %H:%M")})
-            self.cfg["rule_params"] = {**sug["params"], "version": old["version"] + 1,
+            self.cfg["rule_params"] = {"target": old.get("target", 6.0), **sug["params"], "version": old["version"] + 1,
                                        "since": datetime.now().strftime("%Y-%m-%d %H:%M")}
             self.cfg["suggestion"] = None
             save(self.cfg)
-        self.log(f"规则升级到 v{self.cfg['rule_params']['version']}：{sug['params']}（旧：{old}）", order=True)
+        self.log(f"规则升级到 v{self.cfg['rule_params']['version']}（{how}）：{sug['params']}（旧：{old}）", order=True)
 
     def rollback_rule(self):
         with self.lock:
             if not self.cfg["rule_history"]:
                 raise ValueError("没有可以退回的版本")
             prev = self.cfg["rule_history"].pop()
-            self.cfg["rule_params"] = {k: prev[k] for k in ("loss_cap", "trail", "breakeven", "version", "since")}
+            self.cfg["rule_params"] = {"target": 6.0, **{k: prev[k] for k in prev if k != "until"}}
             save(self.cfg)
         self.log(f"规则退回 v{prev['version']}", order=True)
 
@@ -398,11 +423,25 @@ class Engine:
         return {"rules": rules.rules_text(self.cfg["rule_params"]), "version": self.cfg["rule_params"]["version"],
                 "items": out}
 
+    def _trading(self):
+        if not self.trade_lock.acquire(timeout=0.5):
+            raise ValueError("上一笔下单还在处理，请等它完成后再试")
+
     def protect_execute(self, picks):
         """picks：[{code, early}]。重新按规则生成计划再执行，不信任网页传来的价格。"""
+        self._trading()
+        try:
+            return self._protect_execute(picks)
+        finally:
+            self.trade_lock.release()
+
+    def _protect_execute(self, picks):
         items = {it["code"]: it for it in rules.plan(self.positions, self.reports, self.active_rule_codes())}
-        results = []
+        results, seen = [], set()
         for pk in picks:
+            if pk.get("code") in seen:  # 同一只只处理一次
+                continue
+            seen.add(pk.get("code"))
             it = items.get(pk.get("code"))
             if not it or it["action"] == "skip" or it.get("error"):
                 results.append(f"✗ {pk.get('code')}：按规则不能执行（可能已有保护或数据不足）")
@@ -456,6 +495,13 @@ class Engine:
 
     def buy_execute(self, code, qty):
         """重新按规则算一遍再下单；数量只能等于或少于规则算出的股数。"""
+        self._trading()
+        try:
+            return self._buy_execute(code, qty)
+        finally:
+            self.trade_lock.release()
+
+    def _buy_execute(self, code, qty):
         if not self.link.trd:
             raise ValueError("没有连接 moomoo")
         plan = self.buy_plan(code)
@@ -512,19 +558,31 @@ class Engine:
             self.save()
 
     def _protect_new_buy(self, b, filled, avg):
+        with self.trade_lock:  # 和网页上的「一键挂保护单」错开，同一只不会挂两张止损
+            if b["code"] in self.active_rule_codes() and self.desk.held("REAL", b["code"]) < filled:
+                # 可卖数量已被别的止损单占住：刚才「一键挂保护单」已经把这些股数一起保护了
+                self.log(f"{b['name']} 买入成交 {filled:g} 股，已由现有止损规则覆盖，不再重复挂单", order=True)
+                return
+            self._protect_new_buy_locked(b, filled, avg)
+
+    def _protect_new_buy_locked(self, b, filled, avg):
         q = self.quotes.get(b["code"]) or fetch([b["code"]]).get(b["code"]) or {}
         rows = fetch_daily(q["symbol"], 130)
         pos = {"code": b["code"], "name": b["name"], "qty": filled, "cost": avg, "price": q.get("price", avg),
                "side": "long", "market_val": filled * avg}
         r = risk.assess(pos, q.get("price", avg), (self.acct or {}).get("total_assets"), rows, self.cfg["mode"],
-                        params=self.cfg["rule_params"], entry_date=datetime.now().strftime("%Y-%m-%d"))
+                        params=self.cfg["rule_params"], entry_date=us_date())
         spec, err = orders.build(pos, q.get("price", avg), "stop", round(r["trail_stop"], 2), filled)
         if err:
             raise RuntimeError(err)
+        tgt = None
+        if r.get("take_profit"):
+            tgt, _ = orders.build(pos, q.get("price", avg), "target", round(r["take_profit"], 2), filled)
         with self.lock:
-            _, notes = self.bm.create(spec, None, "REAL")
+            _, notes = self.bm.create(spec, tgt, "REAL")
             save(self.cfg)
-        self.log(f"{b['name']} 买入成交 {filled:g} 股 @ {avg:.2f}，已自动挂动态止损 {r['trail_stop']:.2f}", alert=True)
+        self.log(f"{b['name']} 买入成交 {filled:g} 股 @ {avg:.2f}，已自动挂动态止损 {r['trail_stop']:.2f}"
+                 + (f"、止盈 {r['take_profit']:.2f}" if r.get("take_profit") else ""), alert=True)
 
     # ---------- 挂单 / 规则 ----------
     def cancel_order(self, env, oid):
@@ -592,6 +650,7 @@ class Engine:
             pos.append({"code": c, "name": r["name"], "qty": p["qty"], "side": p["side"], "cost": p["cost"],
                         "price": r["price"], "pl_pct": r["pl_pct"], "weight": r["weight"], "atr_pct": r["atr_pct"],
                         "risk_score": r["risk_score"], "trail_stop": r["trail_stop"], "stage": r.get("stop_stage"),
+                        "take_profit": r.get("take_profit"),
                         "protected": c in prot, "signals": r["exit_signals"], "reasons": r["reasons"],
                         "level": risk.LEVELS[r["level"]] if r["level"] is not None else None,
                         "max_loss": r.get("max_loss"), "stop_loss_usd": r.get("stop_loss_usd"),
@@ -627,4 +686,4 @@ class Engine:
     def journal_state(self):
         return {"journal": self.cfg["journal"], "rule_params": self.cfg["rule_params"],
                 "rule_history": self.cfg["rule_history"][-5:], "suggestion": self.cfg["suggestion"],
-                "bt": self.cfg["bt"]}
+                "bt": self.cfg["bt"], "rule_month": self.cfg.get("rule_month")}

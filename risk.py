@@ -15,6 +15,7 @@ TRAIL_LOOKBACK = {"short": 10, "swing": 22}  # 动态止损从最近几天的最
 LOSS_CAP_ATR = 1.0   # 动态止损：相对成本最多亏 1 个 ATR
 TRAIL_ATR = 3.0      # 从最高点回撤 3 个 ATR 跟踪
 BREAKEVEN_ATR = 3.0  # 浮盈 3 个 ATR 后至少保本
+TARGET_ATR = 6.0     # 止盈：成本 + 6 个 ATR 就卖（每月评估在 4/6/8 里调整）
 
 
 def atr(rows, period=14):
@@ -56,7 +57,7 @@ def _gaps(rows):
     return [rows[i][1] / rows[i - 1][2] - 1 for i in range(1, len(rows)) if rows[i - 1][2]]
 
 
-DEFAULT_PARAMS = {"loss_cap": LOSS_CAP_ATR, "trail": TRAIL_ATR, "breakeven": BREAKEVEN_ATR}
+DEFAULT_PARAMS = {"loss_cap": LOSS_CAP_ATR, "trail": TRAIL_ATR, "breakeven": BREAKEVEN_ATR, "target": TARGET_ATR}
 
 
 def assess(pos, price, total_assets, rows, mode="swing", trail_k=None, params=None, entry_date=None):
@@ -156,7 +157,10 @@ def assess(pos, price, total_assets, rows, mode="swing", trail_k=None, params=No
     # 风险分 0~100：仓位集中 30、单日风险 25、波动 15、跳空 15、跌破 20 日线 15
     risk_score = round(min(weight, 100) / 100 * 30 + min(var_pct_assets / 3, 1) * 25 + min(vol_y / 60, 1) * 15
                        + min(gap_through / 10, 1) * 15 + (15 if (price - ma20) * sign < 0 else 0))
+    take_profit = cost + sign * params["target"] * a if params.get("target") else None
     exit_signals = []
+    if take_profit and (price - take_profit) * sign >= 0:
+        exit_signals.append(f"到达止盈 {take_profit:.2f}")
     if (price - trail_stop) * sign <= 0:
         exit_signals.append(f"跌破动态止损 {trail_stop:.2f}" if sign > 0 else f"涨破动态止损 {trail_stop:.2f}")
     if risk_score >= EXIT_SCORE:
@@ -169,7 +173,7 @@ def assess(pos, price, total_assets, rows, mode="swing", trail_k=None, params=No
                worst_day=worst_day, low20=low20, high20=high20, stop=stop, target=target, scenarios=scenarios,
                mode=mode, mode_name=mode_name, stop_atr=stop_atr, target_atr=target_atr,
                gap95=gap95, worst_gap=worst_gap, gap_through=gap_through, max_shares=max_shares,
-               trail_k=trail_k, trail_stop=trail_stop, trail_pct=trail_k * a / price * 100, ma20=ma20,
+               trail_k=trail_k, trail_stop=trail_stop, take_profit=take_profit, trail_pct=trail_k * a / price * 100, ma20=ma20,
                stop_stage=stage, max_loss=(cost - cap) * sign * qty, params=params, anchor=anchor,
                anchor_from=look[0][0] if look else None,
                stop_loss_usd=(cost - trail_stop) * sign * qty,
