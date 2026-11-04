@@ -54,6 +54,7 @@ padding:6px 18px;font-size:12px;color:var(--sub)}
   <button onclick="act('/api/screen').then(()=>toast('已开始选股，约 10~30 秒'))">立即选股</button>
   <label class="sub"><input type="checkbox" id="autoscr" onchange="setOpt('auto_screen',this.checked)"> 每日自动选股</label>
   <label class="sub" title="在 moomoo App 里买的股票也自动挂止损 + 止盈"><input type="checkbox" id="autoprot" onchange="setOpt('auto_protect',this.checked)"> 自动保护持仓</label>
+  <button onclick="pushDlg()">📱 手机推送</button>
   <span id="conn" class="dot bad">● 未连接</span>
 </header>
 <div id="upd" class="banner"></div>
@@ -96,6 +97,17 @@ function render(force){
   if(document.activeElement&&document.activeElement.closest&&document.activeElement.closest("#view")&&!force)return; // 正在输入时不重画
   ({watch:vWatch,pos:vPos,buy:vBuy,orders:vOrders,journal:vJournal})[tab]();
 }
+function pushDlg(){const p=S.settings.push,c=S.settings.check;
+  openM(`<h2>📱 手机推送</h2><p class="sub">止损 / 止盈成交、自动保护失败、离场信号、moomoo 断线、开盘前自检结果会推送到手机。</p>
+  <ol><li>手机上装 <b>ntfy</b>（App Store / Google Play 搜 ntfy）</li>
+  <li>打开 ntfy，点 <b>＋</b> 订阅主题，主题名填：<br><code style="user-select:all;font-size:15px">${esc(p.topic)}</code><br><span class="sub">服务器保持默认 ntfy.sh。主题名就是密码，别发给别人</span></li>
+  <li>勾选下面的「打开推送」，点「发送测试」，手机收到就好了</li></ol>
+  <label class="chk"><input type="checkbox" ${p.enabled?"checked":""} onchange="setOpt('push_enabled',this.checked).then(()=>toast(this.checked?'已打开推送':'已关闭推送'))"> 打开推送</label>
+  <p><button class="acc" onclick="act('/api/push/test').then(()=>toast('已发送，看看手机'))">发送测试</button>
+  <button onclick="act('/api/selfcheck').then(r=>{closeM();toast(r.result.problems.length?'自检发现 '+r.result.problems.length+' 个问题，见日志':'自检 ✓ 一切正常')})">立即自检</button></p>
+  <p class="sub">${p.last?"上次推送 "+esc(p.last):""}${p.error?` <span class="down">推送失败：${esc(p.error)}</span>`:""}</p>
+  <p class="sub">每个交易日美东 9:10~9:30（开盘前）自动自检一次${c?`；上次 ${esc(c.time)}：`+(c.problems.length?c.problems.map(esc).join("；"):"一切正常"):""}</p>
+  <button onclick="closeM()">关闭</button>`)}
 async function doUpdate(){const r=await act("/api/update/apply");toast(r.result);setTimeout(()=>location.reload(),9000)}
 
 function rowClick(kind,id){sel[kind]=id;render(true)}
