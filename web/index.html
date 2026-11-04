@@ -53,6 +53,7 @@ padding:6px 18px;font-size:12px;color:var(--sub)}
   <button class="acc" onclick="addStock()">＋ 添加</button>
   <button onclick="act('/api/screen').then(()=>toast('已开始选股，约 10~30 秒'))">立即选股</button>
   <label class="sub"><input type="checkbox" id="autoscr" onchange="setOpt('auto_screen',this.checked)"> 每日自动选股</label>
+  <label class="sub" title="在 moomoo App 里买的股票也自动挂止损 + 止盈"><input type="checkbox" id="autoprot" onchange="setOpt('auto_protect',this.checked)"> 自动保护持仓</label>
   <span id="conn" class="dot bad">● 未连接</span>
 </header>
 <div id="upd" class="banner"></div>
@@ -89,7 +90,7 @@ function render(force){
   $("tabs").innerHTML=TABS.map(([k,v])=>`<a class="${k===tab?"on":""}" onclick="setTab('${k}')">${v}</a>`).join("");
   if(!S)return;
   $("conn").className="dot "+(S.connected?"ok":"bad");$("conn").textContent="● "+(S.connected?"已连接 moomoo":S.acc_status.split("：")[0]);
-  $("autoscr").checked=S.settings.auto_screen;
+  $("autoscr").checked=S.settings.auto_screen;$("autoprot").checked=S.settings.auto_protect;
   $("log").innerHTML=`<span class="sub">${esc(S.updated)} · 每秒刷新 · 版本 ${esc(S.version)}</span><br>`+S.logs.map(esc).join("<br>");
   const u=S.update;if(u&&u.available){$("upd").style.display="block";$("upd").innerHTML=`发现新版本 <b>${esc(u.available)}</b>：${esc(u.notes||"")} <button class="acc" onclick="doUpdate()">立即更新</button>${u.note?` <span class="sub">${esc(u.note)}</span>`:""}${u.error?` <span class="down">${esc(u.error)}</span>`:""}`}else $("upd").style.display="none";
   if(document.activeElement&&document.activeElement.closest&&document.activeElement.closest("#view")&&!force)return; // 正在输入时不重画
