@@ -9,7 +9,7 @@
 
 import time
 
-MIN_FRAC_USD = 1.0  # moomoo 碎股单笔最低金额
+MIN_FRAC_USD = 5.0  # moomoo 美股碎股单笔最低买入金额
 ACTIVE = {"UNSUBMITTED", "WAITING_SUBMIT", "SUBMITTING", "SUBMITTED", "FILLED_PART"}
 
 
