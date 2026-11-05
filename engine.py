@@ -541,6 +541,16 @@ class Engine:
         plan = rules.buy_plan(code, q, rows, self.acct, held, self.cfg["buy"], self.cfg["rule_params"], pending)
         plan["rules"] = rules.buy_rules_text(self.cfg["buy"], self.cfg["rule_params"])
         plan["screen"] = self.cfg["screen"].get(code)
+        if plan["ok"] and not float(plan["qty"]).is_integer() and not market_open():
+            # 碎股只能在常规交易时段下单：盘外只按整数股算，不够 1 股就等开盘
+            whole = int(plan["qty"])
+            msg = "碎股只能在美股常规交易时段（美东 9:30~16:00）下单"
+            if whole >= 1:
+                plan.update(qty=whole, cost=whole * plan["limit"], max_loss=whole * plan["per_share"])
+                plan["checks"].append((f"{msg}，现在只按整数股算（{whole} 股）", True))
+            else:
+                plan.update(ok=False, qty=0)
+                plan["reasons"].append(f"{msg}，开盘后再算一次")
         if plan["ok"]:
             spec, _ = orders.build_buy(code, plan["limit"], plan["qty"])
             plan["order"] = orders.describe(spec, "REAL")
@@ -563,14 +573,26 @@ class Engine:
         qty = round(float(qty), 4)
         if not 0 < qty <= plan["qty"] or (not self.cfg.get("buy", {}).get("fractional", True) and not qty.is_integer()):
             raise ValueError(f"股数必须大于 0、不超过 {plan['qty']:g}（规则上限）")
+        if not qty.is_integer() and not market_open():
+            raise ValueError("碎股只能在美股常规交易时段（美东 9:30~16:00）下单，开盘后再买，或者只买整数股")
         spec, err = orders.build_buy(plan["code"], plan["limit"], qty)
         if err:
             raise ValueError(err)
         try:
             oid = self.desk.place(spec, "REAL")
         except Exception as e:
-            self.log(f"买入失败 {orders.describe(spec, 'REAL')}：{self._explain(e)}", order=True)
-            raise ValueError(self._explain(e))
+            msg = self._explain(e)
+            self.log(f"买入失败 {orders.describe(spec, 'REAL')}：{msg}", order=True)
+            if "数量不合法" in msg and not qty.is_integer():
+                # 常规时段里碎股仍被拒：说明 moomoo 不接受程序下碎股单，改回只买整股
+                with self.lock:
+                    self.cfg["buy"]["fractional"] = False
+                    save(self.cfg)
+                self.log("⚠ moomoo 不接受程序下碎股单（常规时段也被拒），已自动改回只买整股。"
+                         "碎股可以在 moomoo App 里手动买，买完程序会自动接管保护", order=True, alert=True)
+                raise ValueError("moomoo 不接受程序下碎股单，已自动改回只买整股；碎股请在 moomoo App 里手动买，"
+                                 "程序会自动保护")
+            raise ValueError(msg)
         with self.lock:
             self.cfg["pending_buys"].append({"order_id": oid, "code": plan["code"], "name": plan["name"], "qty": qty,
                                              "limit": plan["limit"], "status": "pending",
