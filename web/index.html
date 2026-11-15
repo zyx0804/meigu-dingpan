@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>美股盯盘</title>
+<title>牛来</title>
 <style>
 :root{--bg:#121316;--panel:#1b1c21;--panel2:#24262c;--stripe:#1f2026;--border:#2e3038;--text:#e8e9ec;--sub:#8b8e97;
 --accent:#ff6a00;--up:#22c38e;--down:#f2495c;--warn:#f0a24a;--sel:#2c3a52;--hi:#3d1d24;--mid:#3a3219}
@@ -48,7 +48,7 @@ padding:6px 18px;font-size:12px;color:var(--sub)}
 </head>
 <body>
 <header>
-  <h1>美股盯盘</h1>
+  <h1>牛来</h1>
   <input id="code" placeholder="输入代码 如 AAPL" size="14">
   <button class="acc" onclick="addStock()">＋ 添加</button>
   <button onclick="act('/api/screen').then(()=>toast('已开始选股，约 10~30 秒'))">立即选股</button>
@@ -161,6 +161,9 @@ async function protect(){const pl=await api("/api/protect/plan");
 function vBuy(){const b=S.settings.buy;
   $("view").innerHTML=`<div class="bar">买入代码 <input id="bcode" placeholder="如 MCD" size="10" value="${esc(sel.b||"")}"> <button class="acc" onclick="buyPlanGo()">按规则计算</button>
    <label class="sub"><input type="checkbox" ${S.settings.buy.fractional!==false?"checked":""} onchange="setOpt('fractional',this.checked).then(()=>{buyPlan=null;render(true)})"> 允许碎股</label>
+   <label class="sub">策略 <select onchange="setOpt('strategy',this.value).then(()=>{buyPlan=null;toast('已切换，重新点「按规则计算」');render(true)})">
+     <option value="dip" ${S.settings.strategy==="dip"?"selected":""}>回调抄底 + 分批</option>
+     <option value="trend" ${S.settings.strategy==="trend"?"selected":""}>追涨（旧规则）</option></select></label>
    <span class="sub" style="margin-left:12px">单笔最多亏总资产 <input id="rp" value="${b.risk_pct}" size="3">% · 单只最多占总资产 <input id="mp" value="${b.max_pos_pct}" size="3">%</span>
    <button onclick="setOpt('risk_pct',$('rp').value).then(()=>setOpt('max_pos_pct',$('mp').value)).then(()=>toast('已保存'))">保存</button></div>
   <div id="bplan"></div>
@@ -173,7 +176,9 @@ async function buyPlanGo(){const c=$("bcode").value.trim();if(!c)return;sel.b=c;
   try{buyPlan=await api("/api/buy/plan?code="+encodeURIComponent(c));showBuy(buyPlan)}catch(e){$("bplan").innerHTML=`<p class="down">${esc(e.message)}</p>`}}
 function showBuy(p){const el=$("bplan");if(!el)return;
   el.innerHTML=`<div class="box"><h3>${esc(p.name)}（${esc(p.code)}） ${p.ok?'<span class="up">✓ 符合买入规则</span>':'<span class="down">✗ 不符合买入规则</span>'}</h3>
-  ${p.price?`<p>现价 ${n(p.price)} · 限价 <b>${n(p.limit)}</b> · 止损 <b>${n(p.stop)}</b> · 止盈 <b>${n(p.target)}</b>（ATR ${n(p.atr)}）· 每股风险 ${money(p.per_share)}</p>`:""}
+  ${p.price?(p.style==="dip"?`<p>现价 ${n(p.price)} · 限价 <b>${n(p.limit)}</b> · 止损 <b>${n(p.stop)}</b>（ATR ${n(p.atr)}）· 每股风险 ${money(p.per_share)}</p>
+   <p class="sub">分批：现在买第一批；跌到 <b>${n(p.add_px)}</b> 自动补同样股数 · 收盘站上 ${p.exit_ma} 日线先卖一半 · 剩下保本 + 跟踪 · 最多 ${p.max_days} 个交易日</p>`
+   :`<p>现价 ${n(p.price)} · 限价 <b>${n(p.limit)}</b> · 止损 <b>${n(p.stop)}</b> · 止盈 <b>${n(p.target)}</b>（ATR ${n(p.atr)}）· 每股风险 ${money(p.per_share)}</p>`):""}
   <ul>${p.checks.map(([t,ok])=>`<li class="${ok?"up":"down"}">${ok?"✓":"✗"} ${esc(t)}</li>`).join("")}</ul>
   ${p.reasons.length?`<p class="down">${p.reasons.map(esc).join("<br>")}</p>`:""}
   ${p.ok?`<p>规则上限 <b>${p.qty}</b> 股 · 约 ${money(p.cost)} · 打到止损最多亏 ${money(p.max_loss)}（${n(p.max_loss_pct)}% 总资产）</p>

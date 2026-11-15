@@ -9,7 +9,7 @@
 
 import time
 
-MIN_FRAC_USD = 1.0  # moomoo 碎股单笔最低金额
+MIN_FRAC_USD = 5.0  # moomoo 美股碎股单笔最低买入金额
 ACTIVE = {"UNSUBMITTED", "WAITING_SUBMIT", "SUBMITTING", "SUBMITTED", "FILLED_PART"}
 
 
@@ -122,7 +122,7 @@ class OrderDesk:
         ret, df = self.link.trd.place_order(
             price=spec["price"], qty=spec["qty"], code=spec["code"], trd_side=spec["trd_side"],
             order_type=spec["order_type"], aux_price=spec["aux_price"], trd_env=env, acc_id=self._acc(env),
-            time_in_force=spec["time_in_force"], session=spec["session"], remark="盯盘-" + spec["kind"],
+            time_in_force=spec["time_in_force"], session=spec["session"], remark="牛来-" + spec["kind"],
             trail_type=spec.get("trail_type"), trail_value=spec.get("trail_value"))
         if ret != RET_OK:
             raise RuntimeError(str(df))

@@ -1,4 +1,4 @@
-"""美股盯盘 —— 轻量版：行情、到价提醒，连上 moomoo 后自动评估持仓风险，可为持仓挂止损/止盈单（需逐张确认）。"""
+"""牛来 —— 轻量版：行情、到价提醒，连上 moomoo 后自动评估持仓风险，可为持仓挂止损/止盈单（需逐张确认）。"""
 import json
 import os
 import sys
@@ -42,7 +42,7 @@ class App:
         self.acc_status = "未连接：请先打开 moomoo OpenD 并登录"
         self.hist = {}  # 代码 -> (日期, 日K)
         self.reports = {}
-        root.title("美股盯盘")
+        root.title("牛来")
         root.geometry("1180x640")
         root.minsize(900, 480)
         theme.apply(root)
@@ -50,7 +50,7 @@ class App:
         # ---- 顶栏：标题 + 自选操作 + 连接状态 ----
         self.topbar = bar = ttk.Frame(root, padding=(14, 10, 14, 6))
         bar.pack(fill="x")
-        ttk.Label(bar, text="美股盯盘", style="Title.TLabel").pack(side="left", padx=(0, 16))
+        ttk.Label(bar, text="牛来", style="Title.TLabel").pack(side="left", padx=(0, 16))
         self.entry = ttk.Entry(bar, width=16)
         self.entry.pack(side="left")
         self.entry.bind("<Return>", lambda e: self.add())
@@ -1245,7 +1245,7 @@ class App:
                 w.pack_forget()
             self.minibar = ttk.Frame(self.root, padding=(10, 6))
             self.minibar.pack(fill="x", before=self.nb)
-            ttk.Label(self.minibar, text="美股盯盘", style="Title.TLabel", font=(theme.FONT, 11, "bold")).pack(side="left")
+            ttk.Label(self.minibar, text="牛来", style="Title.TLabel", font=(theme.FONT, 11, "bold")).pack(side="left")
             ttk.Button(self.minibar, text="还原", command=self.toggle_mini).pack(side="right")
             self.nb.configure(style="Mini.TNotebook")
             ttk.Style().layout("Mini.TNotebook.Tab", [])  # 迷你模式隐藏标签页
@@ -1278,7 +1278,7 @@ class App:
 
 
 def single_instance():
-    """同一时间只允许开一个盯盘程序：多开会让联动规则被执行多次。返回占位 socket，未拿到则返回 None。"""
+    """同一时间只允许开一个牛来：多开会让联动规则被执行多次。返回占位 socket，未拿到则返回 None。"""
     import socket
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -1321,7 +1321,7 @@ if __name__ == "__main__":
         except OSError:
             r = tk.Tk()
             r.withdraw()
-            messagebox.showinfo("美股盯盘", "盯盘程序已经在运行了（看看任务栏），不用重复打开。")
+            messagebox.showinfo("牛来", "牛来已经在运行了（看看任务栏），不用重复打开。")
         raise SystemExit
     root = tk.Tk()
     App(root)

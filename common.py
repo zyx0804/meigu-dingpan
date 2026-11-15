@@ -34,6 +34,7 @@ DEFAULT = {
     # 买入规则：单笔打到止损最多亏总资产的 risk_pct%；单只股票市值最多占总资产 max_pos_pct%
     "buy": {"risk_pct": 2.0, "max_pos_pct": 50.0, "fractional": True},  # fractional：允许买碎股
     "pending_buys": [],   # 已下单、等待成交的买单（成交后自动挂止损）
+    "strategy": "dip",    # 买卖策略：dip 回调抄底 + 分批（默认）/ trend 追涨（旧规则）
     "auto_protect": True,  # 没有被规则保护的持仓（比如在 moomoo App 里买的）自动挂止损 + 止盈
 }
 INDICES = ("usDJI", "usIXIC", "usINX")

@@ -26,6 +26,7 @@ AUTO_PROTECT_WAIT = 30    # 发现没保护的持仓后等 30 秒再挂，给程
 AUTO_PROTECT_RETRY = 600  # 挂不上（没解锁交易、可卖不足等）时 10 分钟后再试
 DOWN_ALERT_SECS = 120     # moomoo 连接断开超过 2 分钟就推送到手机
 CHECK_FROM, CHECK_TO = (9, 10), (9, 30)  # 开盘前自检：美东 9:10~9:30 之间做一次
+CLOSE_WINDOW = (15, 45)  # 抄底规则的「收盘站上 10 日线卖一半」「到期卖出」在美东 15:45 之后判断
 
 
 class Engine:
@@ -64,7 +65,7 @@ class Engine:
         if alert and getattr(self, "push", None) and "风险分" not in msg:  # 风险分每天都会报，不推送
             urgent = any(k in msg for k in ("止损", "失败", "⚠", "断开", "离场", "撤"))
             # 优先级 4 以上手机才会弹窗；止损、失败、断线这类紧急的用最高优先级 5（振动更长）
-            self.push.send("美股盯盘", msg, priority=5 if urgent else 4)
+            self.push.send("牛来", msg, priority=5 if urgent else 4)
         with self.lock:
             self.logs.insert(0, line)
             del self.logs[200:]
@@ -97,6 +98,7 @@ class Engine:
                 self.refresh_orders()
                 self.check_pending_buys()
                 self.auto_protect()
+                self.dip_addons()
                 self.watch_connection(t0)
                 self.maybe_self_check()
             if t0 - last_daily >= 60:
@@ -174,22 +176,34 @@ class Engine:
             return set()
         return {p["code"] for p in self.positions if p.get("today_buy", 0) > 0}
 
-    def _protect(self, stop_spec, target_spec):
-        """建立保护：整数股照常挂服务器止损单；不足 1 股的碎股部分由程序盯价。返回说明列表。"""
+    def _protect(self, stop_spec, target_spec, extra=None):
+        """建立保护：整数股照常挂服务器止损单；不足 1 股的碎股部分由程序盯价。返回说明列表。
+        extra：抄底规则的信息（买入日、初始止损、ATR、成本、补仓计划）；补仓计划只放在第一条规则上。"""
         q = float(stop_spec["qty"])
         whole, frac = int(q), round(q - int(q), 6)
         notes = []
+        extra = dict(extra or {})
+        rest = {k: v for k, v in extra.items() if k != "add"}
         with self.lock:
             if whole >= 1:
                 _, n = self.bm.create({**stop_spec, "qty": whole}, target_spec and {**target_spec, "qty": whole},
-                                      "REAL", server_target=not self._cash())
+                                      "REAL", server_target=not self._cash(), extra=extra)
                 notes += n
+                extra = rest
             if frac > 0:
                 _, n = self.bm.create_local({**stop_spec, "qty": frac}, target_spec and {**target_spec, "qty": frac},
-                                            "REAL")
+                                            "REAL", extra=extra)
                 notes += n
             save(self.cfg)
         return notes
+
+    def _extra_for(self, it):
+        """一键保护 / 自动保护：当前策略是抄底时，新规则按抄底管理（没有补仓计划）。"""
+        c = it["code"]
+        if self.style_of(c) != "dip" or not it["specs"]:
+            return None
+        r = self.reports.get(c, {})
+        return self._dip_extra(c, it["specs"][0]["aux_price"], r.get("atr"), it["pos"]["cost"])
 
     def active_rule_codes(self):
         return {"us" + b["code"].split(".", 1)[1] for b in self.cfg["brackets"]
@@ -200,10 +214,17 @@ class Engine:
         for p in self.positions:
             c = p["code"]
             price = self.quotes.get(c, {}).get("price", p["price"])
+            style = self.style_of(c)
             r = risk.assess(p, price, a and a["total_assets"], self.hist.get(c, (None, []))[1], self.cfg["mode"],
-                            self.cfg["bt"].get("k"), params=self.cfg["rule_params"],
+                            self.cfg["bt"].get("k"), params={**self.cfg["rule_params"], "style": style},
                             entry_date=journal.entry_date(self.cfg["journal"].get("open", {}), c))
-            r.update(code=c, name=p["name"], price=price, pos=p)
+            r.update(code=c, name=p["name"], price=price, pos=p, style=style)
+            stops = [b["stop_desc"]["aux_price"] for b in self._dip_rules(c)]
+            if stops and r.get("trail_stop") is not None:  # 抄底持仓：显示规则里真正的止损（卖掉一半后会上调）
+                r["trail_stop"] = min(stops)
+                r["exit_signals"] = [s for s in r["exit_signals"] if not s.startswith(("跌破动态止损", "涨破动态止损"))]
+                if price <= r["trail_stop"]:
+                    r["exit_signals"].insert(0, f"跌破动态止损 {r['trail_stop']:.2f}")
             reports[c] = r
             today = us_date()
             for sig in r["exit_signals"]:
@@ -213,15 +234,119 @@ class Engine:
                     self.log(f"离场信号 · {p['name']}({c})：{sig}（现价 {price}）", alert=True)
         self.reports = reports
 
+    # ---------- 回调抄底 + 分批 ----------
+    def style_of(self, code):
+        """这只持仓按哪套规则管：有抄底规则就是 dip；有旧规则（没标 style）就是 trend；还没规则就按当前策略。"""
+        rs = [b for b in self.cfg["brackets"] if b["status"] == "active" and b["env"] == "REAL"
+              and "us" + b["code"].split(".", 1)[1] == code]
+        if rs:
+            return "dip" if any(b.get("style") == "dip" for b in rs) else "trend"
+        return self.cfg.get("strategy", "dip")
+
+    def _dip_rules(self, code=None):
+        return [b for b in self.cfg["brackets"] if b["status"] == "active" and b.get("style") == "dip"
+                and (code is None or "us" + b["code"].split(".", 1)[1] == code)]
+
+    def _days_held(self, rows, entry):
+        """买入后过了几个交易日（含今天）。日 K 一天只拉一次，可能还没有今天这根，所以今天单独算。"""
+        today = us_date()
+        return sum(1 for r in rows if entry < r[0] < today) + (1 if today > entry else 0)
+
+    def dip_plan_exits(self):
+        """抄底规则：算出每条规则现在该把止损提到哪（卖掉一半后：至少保本 + 最高点回落 2.5 ATR），
+        以及收盘前该不该卖（站上 10 日线卖一半 / 持有满 20 天全卖）。返回 (按规则 id 的止损, 卖出动作)。"""
+        d, dyn, acts = risk.DIP, {}, {}
+        t = us_now()
+        closing = market_open() and (t.hour, t.minute) >= CLOSE_WINDOW
+        today = us_date()
+        for b in self._dip_rules():
+            c = "us" + b["code"].split(".", 1)[1]
+            rows = self.hist.get(c, (None, []))[1]
+            px = self.quotes.get(c, {}).get("price")
+            if not rows or not px:
+                continue
+            entry, a0 = b.get("entry") or today, b.get("atr0") or risk.atr(rows)
+            if b.get("half_sold"):
+                high = max([r[3] for r in rows if r[0] >= entry] + [px])
+                dyn[b["id"]] = max(b.get("stop0", 0), b.get("cost", 0) * 1.001, high - d["trail"] * a0)
+            if not closing:
+                continue
+            days = self._days_held(rows, entry)
+            past = [r[2] for r in rows if r[0] < today][-(d["exit_ma"] - 1):]
+            ma = (sum(past) + px) / (len(past) + 1)
+            if days >= d["max_days"]:
+                acts[b["id"]] = "all"
+                b["exit_why"] = f"持有满 {d['max_days']} 个交易日"
+            elif not b.get("half_sold") and days >= 1 and px > ma:
+                acts[b["id"]] = "half"
+        return dyn, acts
+
+    def dip_addons(self):
+        """分批买的第二批：常规时段价格跌到补仓价、还没破止损，就按第一批同样的股数限价补一半。只补一次。"""
+        if not self.link.trd or not market_open():
+            return
+        for b in self._dip_rules():
+            add = b.get("add")
+            if not add or add.get("done") or b.get("half_sold") or b.get("phase"):
+                continue
+            c = "us" + b["code"].split(".", 1)[1]
+            px = self.quotes.get(c, {}).get("price")
+            rows = self.hist.get(c, (None, []))[1]
+            if not px or px > add["px"]:
+                continue
+            add["done"] = True
+            why = None
+            if px <= b.get("stop0", 0):
+                why = "已经跌破止损"
+            elif rows and self._days_held(rows, b.get("entry", us_date())) >= risk.DIP["max_days"]:
+                why = "已经持有满期"
+            elif not float(add["qty"]).is_integer() and not self.cfg["buy"].get("fractional", True):
+                why = "关闭了碎股"
+            power = (self.acct or {}).get("power") or 0
+            if not why and power < add["qty"] * px * 1.01:
+                why = f"购买力 ${power:,.2f} 不够"
+            if why:
+                self.log(f"规则 {b['id']} 到了补仓价 {add['px']}，但{why}，不补仓", order=True, alert=True)
+                self.save()
+                continue
+            if not self.trade_lock.acquire(blocking=False):
+                add["done"] = False
+                continue
+            try:
+                spec, err = orders.build_buy(c, round(px * 1.002, 2), add["qty"])
+                if err:
+                    raise RuntimeError(err)
+                oid = self.desk.place(spec, "REAL")
+                with self.lock:
+                    self.cfg["pending_buys"].append({
+                        "order_id": oid, "code": c, "name": self.quotes.get(c, {}).get("name", c), "qty": add["qty"],
+                        "limit": spec["price"], "status": "pending", "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "style": "dip", "stop0": b.get("stop0"), "atr0": b.get("atr0"), "entry": b.get("entry"),
+                        "addon_of": b["id"]})
+                    save(self.cfg)
+                self.log(f"规则 {b['id']} 分批买第二批：跌到补仓价 {add['px']}，限价 {spec['price']} 补 {add['qty']:g} 股，"
+                         f"订单号 {oid}", order=True, alert=True)
+            except Exception as e:
+                self.log(f"⚠ 规则 {b['id']} 补仓失败：{self._explain(e)}", order=True, alert=True)
+                self.save()
+            finally:
+                self.trade_lock.release()
+
+    def _dip_extra(self, code, stop0, atr0, cost, entry=None, add=None):
+        return {"style": "dip", "entry": entry or journal.entry_date(self.cfg["journal"].get("open", {}), code) or us_date(),
+                "stop0": stop0, "atr0": atr0, "cost": cost, "half_sold": False, **({"add": add} if add else {})}
+
     def run_brackets(self):
         if not self.link.trd or not any(b["status"] == "active" for b in self.cfg["brackets"]):
             return
         prices = {c: d.get("price") for c, d in self.quotes.items()}
-        dyn = {c: r["trail_stop"] for c, r in self.reports.items() if r.get("trail_stop")}
+        dyn = {c: r["trail_stop"] for c, r in self.reports.items() if r.get("trail_stop") and r.get("style") != "dip"}
         tps = {c: r["take_profit"] for c, r in self.reports.items() if r.get("take_profit")}
+        dip_dyn, acts = self.dip_plan_exits()
+        dyn.update(dip_dyn)
         with self.lock:
             before = json.dumps(self.cfg["brackets"], sort_keys=True, default=str)
-            self.bm.tick(prices, self.desk.position_qty, dyn, tps, market_open(), self.t1_hold())
+            self.bm.tick(prices, self.desk.position_qty, dyn, tps, market_open(), self.t1_hold(), acts)
             if json.dumps(self.cfg["brackets"], sort_keys=True, default=str) != before:
                 save(self.cfg)
 
@@ -286,6 +411,8 @@ class Engine:
                 self.cfg["mode"] = value
             elif key in ("auto_screen", "auto_protect"):
                 self.cfg[key] = bool(value)
+            elif key == "strategy" and value in ("dip", "trend"):
+                self.cfg["strategy"] = value
             elif key == "fractional":
                 self.cfg["buy"]["fractional"] = bool(value)
             elif key == "push_enabled":
@@ -313,7 +440,7 @@ class Engine:
             pool = dict.fromkeys(["us" + c for c in screener.UNIVERSE] +
                                  [c for c in self.cfg["stocks"] if c not in INDICES])
             q = fetch(list(pool))
-            ranked = screener.run({c: d["symbol"] for c, d in q.items()})
+            ranked = screener.run({c: d["symbol"] for c, d in q.items()}, self.cfg.get("strategy", "dip"))
             for x in ranked:
                 x["name"] = q.get(x["code"], {}).get("name", x["code"])
             if not ranked:
@@ -331,7 +458,8 @@ class Engine:
             self.cfg["ignore"] = {c: d for c, d in self.cfg["ignore"].items()
                                   if datetime.strptime(d, "%Y-%m-%d").toordinal() > cutoff}
             protected = set(INDICES) | {p["code"] for p in self.positions} | set(self.cfg["locked"])
-            add, remove = screener.plan_changes(ranked, self.cfg["stocks"], protected, set(self.cfg["ignore"]))
+            add, remove = screener.plan_changes(ranked, self.cfg["stocks"], protected, set(self.cfg["ignore"]),
+                                                self.cfg.get("strategy", "dip"))
             for c in remove:
                 for key in ("auto", "stocks"):
                     if c in self.cfg[key]:
@@ -407,7 +535,8 @@ class Engine:
         cur = {k: self.cfg["rule_params"][k] for k in tuner.KEYS}
         month = last_session()[:7]
         # 交易规则每月评估一次（每月第一个交易日收盘后），盘中不换规则；复盘统计照常每天更新
-        tune = self.cfg.get("rule_month") != month and not market_open(10)
+        tune = (self.cfg.get("rule_month") != month and not market_open(10)
+                and self.cfg.get("strategy", "dip") != "dip")  # 抄底参数是固定的，不让月度评估乱调
         base, best, cands, w = tuner.suggest(cur, data, entries, len(closed)) if tune else (None, None, [], None)
         brief = lambda ev: ev and {"params": ev["params"], "avg": ev["pooled"]["avg"], "worst": ev["pooled"]["worst"],
                                    "mdd": ev["pooled"]["mdd"], "trades": ev["pooled"]["trades"],
@@ -512,7 +641,8 @@ class Engine:
                     results.append(f"✓ {it['name']} 规则离场单已提交，订单号 {oid}")
                     self.log(f"一键：规则离场 {orders.describe(s, 'REAL')} 订单号 {oid}", order=True)
                 else:
-                    notes = self._protect(it["specs"][0], it["specs"][1] if len(it["specs"]) > 1 else None)
+                    notes = self._protect(it["specs"][0], it["specs"][1] if len(it["specs"]) > 1 else None,
+                                          self._extra_for(it))
                     results.append(f"✓ {it['name']}：" + "；".join(notes))
             except Exception as e:
                 results.append(f"✗ {it['name']}：{self._explain(e)}")
@@ -535,12 +665,24 @@ class Engine:
         q = self.quotes.get(code) or fetch([code]).get(code)
         if not q:
             raise ValueError("拿不到这只股票的行情")
-        rows = fetch_daily(q["symbol"], 130)
+        style = self.cfg.get("strategy", "dip")
+        rows = fetch_daily(q["symbol"], 260 if style == "dip" else 130)
         held = sum(p["qty"] for p in self.positions if p["code"] == code and p["side"] == "long")
         pending = {b["code"] for b in self.cfg["pending_buys"] if b["status"] == "pending"}
-        plan = rules.buy_plan(code, q, rows, self.acct, held, self.cfg["buy"], self.cfg["rule_params"], pending)
-        plan["rules"] = rules.buy_rules_text(self.cfg["buy"], self.cfg["rule_params"])
+        plan = rules.buy_plan(code, q, rows, self.acct, held, self.cfg["buy"], self.cfg["rule_params"], pending, style)
+        plan["rules"] = (rules.dip_rules_text(self.cfg["buy"]) if style == "dip"
+                         else rules.buy_rules_text(self.cfg["buy"], self.cfg["rule_params"]))
         plan["screen"] = self.cfg["screen"].get(code)
+        if plan["ok"] and not float(plan["qty"]).is_integer() and not market_open():
+            # 碎股只能在常规交易时段下单：盘外只按整数股算，不够 1 股就等开盘
+            whole = int(plan["qty"])
+            msg = "碎股只能在美股常规交易时段（美东 9:30~16:00）下单"
+            if whole >= 1:
+                plan.update(qty=whole, cost=whole * plan["limit"], max_loss=whole * plan["per_share"])
+                plan["checks"].append((f"{msg}，现在只按整数股算（{whole} 股）", True))
+            else:
+                plan.update(ok=False, qty=0)
+                plan["reasons"].append(f"{msg}，开盘后再算一次")
         if plan["ok"]:
             spec, _ = orders.build_buy(code, plan["limit"], plan["qty"])
             plan["order"] = orders.describe(spec, "REAL")
@@ -563,17 +705,31 @@ class Engine:
         qty = round(float(qty), 4)
         if not 0 < qty <= plan["qty"] or (not self.cfg.get("buy", {}).get("fractional", True) and not qty.is_integer()):
             raise ValueError(f"股数必须大于 0、不超过 {plan['qty']:g}（规则上限）")
+        if not qty.is_integer() and not market_open():
+            raise ValueError("碎股只能在美股常规交易时段（美东 9:30~16:00）下单，开盘后再买，或者只买整数股")
         spec, err = orders.build_buy(plan["code"], plan["limit"], qty)
         if err:
             raise ValueError(err)
         try:
             oid = self.desk.place(spec, "REAL")
         except Exception as e:
-            self.log(f"买入失败 {orders.describe(spec, 'REAL')}：{self._explain(e)}", order=True)
-            raise ValueError(self._explain(e))
+            msg = self._explain(e)
+            self.log(f"买入失败 {orders.describe(spec, 'REAL')}：{msg}", order=True)
+            if "数量不合法" in msg and not qty.is_integer():
+                # 常规时段里碎股仍被拒：说明 moomoo 不接受程序下碎股单，改回只买整股
+                with self.lock:
+                    self.cfg["buy"]["fractional"] = False
+                    save(self.cfg)
+                self.log("⚠ moomoo 不接受程序下碎股单（常规时段也被拒），已自动改回只买整股。"
+                         "碎股可以在 moomoo App 里手动买，买完程序会自动接管保护", order=True, alert=True)
+                raise ValueError("moomoo 不接受程序下碎股单，已自动改回只买整股；碎股请在 moomoo App 里手动买，"
+                                 "程序会自动保护")
+            raise ValueError(msg)
         with self.lock:
+            dip = {"style": "dip", "stop0": plan["stop"], "atr0": plan["atr"], "entry": us_date(),
+                   "add": {"px": plan["add_px"], "qty": qty, "done": False}} if plan.get("style") == "dip" else {}
             self.cfg["pending_buys"].append({"order_id": oid, "code": plan["code"], "name": plan["name"], "qty": qty,
-                                             "limit": plan["limit"], "status": "pending",
+                                             "limit": plan["limit"], "status": "pending", **dip,
                                              "created": datetime.now().strftime("%Y-%m-%d %H:%M")})
             save(self.cfg)
         self.log(f"买入单已提交 {orders.describe(spec, 'REAL')} 订单号 {oid}", order=True)
@@ -624,14 +780,21 @@ class Engine:
         pos = {"code": b["code"], "name": b["name"], "qty": filled, "cost": avg, "price": q.get("price", avg),
                "side": "long", "market_val": filled * avg}
         r = risk.assess(pos, q.get("price", avg), (self.acct or {}).get("total_assets"), rows, self.cfg["mode"],
-                        params=self.cfg["rule_params"], entry_date=us_date())
+                        params={**self.cfg["rule_params"], "style": b.get("style", "trend")}, entry_date=us_date())
+        if b.get("style") == "dip":  # 抄底：止损用买入时定好的价格；第二批补仓沿用第一批的止损和买入日
+            r.update(trail_stop=b["stop0"], take_profit=None)
+            if b.get("add"):
+                b["add"]["qty"] = filled if float(filled).is_integer() else round(filled, 4)
+            extra = self._dip_extra(b["code"], b["stop0"], b.get("atr0") or r.get("atr"), avg, b.get("entry"), b.get("add"))
+        else:
+            extra = None
         spec, err = orders.build(pos, q.get("price", avg), "stop", round(r["trail_stop"], 2), filled)
         if err:
             raise RuntimeError(err)
         tgt = None
         if r.get("take_profit"):
             tgt, _ = orders.build(pos, q.get("price", avg), "target", round(r["take_profit"], 2), filled)
-        self._protect(spec, tgt)
+        self._protect(spec, tgt, extra)
         self.log(f"{b['name']} 买入成交 {filled:g} 股 @ {avg:.2f}，已自动挂动态止损 {r['trail_stop']:.2f}"
                  + (f"、止盈 {r['take_profit']:.2f}" if r.get("take_profit") else ""), alert=True)
 
@@ -697,11 +860,11 @@ class Engine:
         else:
             msg = "开盘前自检 ✓ 一切正常：" + "；".join(oks)
             self.log(msg)
-            self.push.send("美股盯盘", msg, priority=2)
+            self.push.send("牛来", msg, priority=2)
         return self.check_result
 
     def push_test(self):
-        self.push.send("美股盯盘", f"测试推送 ✓ 能收到这条，就说明手机推送设置好了（{datetime.now():%H:%M:%S}）",
+        self.push.send("牛来", f"测试推送 ✓ 能收到这条，就说明手机推送设置好了（{datetime.now():%H:%M:%S}）",
                        priority=4, force=True)
 
     # ---------- 自动保护：在 moomoo App 里买的股票也自动挂止损 + 止盈 ----------
@@ -753,7 +916,7 @@ class Engine:
                     self._ap_retry[c] = now + AUTO_PROTECT_RETRY
                     continue
                 specs = it["specs"]
-                self._protect(specs[0], specs[1] if len(specs) > 1 else None)
+                self._protect(specs[0], specs[1] if len(specs) > 1 else None, self._extra_for(it))
                 self._unprot.pop(c, None)
                 created = True
                 self.log(f"自动保护：{p['name']} {need:g} 股不在规则里，已按规则挂上保护（{it['why']}）", order=True,
@@ -852,6 +1015,7 @@ class Engine:
                                "stop": f"跟踪 {sd['trail_value']}%" if sd["order_type"] == "TRAILING_STOP"
                                else f"触发 {sd['aux_price']}", "stop_id": b["stop_id"], "target": b["target"],
                                "ratchets": b.get("ratchets", 0), "status": STATUS_NAME[b["status"]],
+                               "style": b.get("style", "trend"), "half_sold": b.get("half_sold", False),
                                "active": b["status"] == "active", "created": b["created"]})
         return {"updated": self.updated, "connected": self.acc_status == "已连接", "acc_status": self.acc_status,
                 "watch": watch, "positions": pos, "account": account, "orders": self.order_rows,
@@ -860,6 +1024,7 @@ class Engine:
                 "pending_buys": [b for b in cfg["pending_buys"] if b["status"] == "pending"],
                 "settings": {"mode": cfg["mode"], "modes": {k: v[0] for k, v in risk.MODES.items()},
                              "auto_screen": cfg["auto_screen"], "auto_protect": cfg.get("auto_protect", True), "buy": cfg["buy"],
+                             "strategy": cfg.get("strategy", "dip"),
                              "push": {**cfg["push"], **self.push.status}, "check": self.check_result,
                              "rule_params": cfg["rule_params"]},
                 "screening": self.screening, "backtesting": self.backtesting,

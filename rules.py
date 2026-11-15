@@ -26,6 +26,24 @@ def rules_text(params=None):
 RULES = rules_text()
 
 
+def dip_rules_text(buy_cfg):
+    d = risk.DIP
+    return [
+        "只买美股个股，只用限价单，当日有效，只在常规交易时段成交",
+        f"回调抄底：长期趋势向上（站上 200 日线），并且从最近 20 天的最高点回落了至少 {d['pullback']:g} 个 ATR",
+        f"止损先定好：买入价 − {d['stop']:g} ATR（挂在 moomoo 服务器上，碎股部分由程序盯价）",
+        f"分批买：先买半仓；之后再跌 {d['add']:g} ATR、还没破止损，就自动按同样股数补另一半（限价单，常规时段）",
+        f"分批卖：收盘站上 {d['exit_ma']} 日线先卖一半落袋；剩下的至少保本，并从买入后的最高点回落 {d['trail']:g} ATR 就卖",
+        f"最多持有 {d['max_days']} 个交易日，到期收盘前卖掉",
+        f"股数：整笔（两批合计）打到止损最多亏总资产 {buy_cfg['risk_pct']:g}%，市值不超过总资产 {buy_cfg['max_pos_pct']:g}%；"
+        "第一批是一半，并且不超过购买力",
+        ("支持碎股：股数精确到 0.0001 股，金额至少 $5，只能在常规交易时段下单"
+         if buy_cfg.get("fractional", True) else "只买整股：算出来不足 1 股就不买"),
+        "同一只股票已有未成交的买单时不重复下单",
+        "现金账户 T+1：当天买入的股票当天不卖（止损除外）",
+    ]
+
+
 def buy_rules_text(buy_cfg, params=None):
     p = {**risk.DEFAULT_PARAMS, **(params or {})}
     return [
@@ -34,16 +52,19 @@ def buy_rules_text(buy_cfg, params=None):
         f"止损先定好再买：止损价 = 买入价 − {p['loss_cap']:g} ATR；止盈 = 买入价 + {p['target']:g} ATR（和持仓同一套规则）",
         f"股数 = 以下三者取最小：打到止损最多亏总资产 {buy_cfg['risk_pct']:g}%；"
         f"这只股票市值不超过总资产 {buy_cfg['max_pos_pct']:g}%（含已持有部分）；不超过购买力",
-        ("支持碎股：股数精确到 0.0001 股，金额至少 $1；碎股部分由程序盯价止损（需要程序和 OpenD 开着）"
+        ("支持碎股：股数精确到 0.0001 股，金额至少 $5，只能在常规交易时段下单；碎股部分由程序盯价止损（需要程序和 OpenD 开着）"
          if buy_cfg.get("fractional", True) else "只买整股：算出来不足 1 股就不买，并告诉你差多少"),
         "同一只股票已有未成交的买单时不重复下单",
         "成交后自动挂上动态止损单并交给自动规则管理（自动上调、自动撤单）",
     ]
 
 
-def buy_plan(code, quote, rows, acct, held_qty, buy_cfg, params=None, pending_codes=()):
-    """按买入规则算出计划。quote：现价等；rows：日 K（至少 60 根）；held_qty：已持有股数。
+def buy_plan(code, quote, rows, acct, held_qty, buy_cfg, params=None, pending_codes=(), style="trend"):
+    """按买入规则算出计划。quote：现价等；rows：日 K（追涨至少 60 根，抄底至少 210 根）；held_qty：已持有股数。
+    style：trend 追涨 / dip 回调抄底 + 分批。
     返回 dict：ok（能不能买）、reasons（不能买的原因）、以及价格 / 股数 / 止损 / 风险。"""
+    if style == "dip":
+        return _dip_plan(code, quote, rows, acct, held_qty, buy_cfg, pending_codes)
     p = {**risk.DEFAULT_PARAMS, **(params or {})}
     out = {"code": code, "name": quote.get("name", code), "ok": False, "reasons": [], "checks": []}
     price = quote.get("price")
@@ -99,6 +120,56 @@ def buy_plan(code, quote, rows, acct, held_qty, buy_cfg, params=None, pending_co
         qty = 0
     out.update(price=price, limit=limit, stop=stop, target=target, atr=a, qty=qty, per_share=per_share,
                cost=qty * limit, max_loss=qty * per_share, max_loss_pct=qty * per_share / total * 100 if total else None)
+    out["ok"] = not out["reasons"]
+    return out
+
+
+def _sizes(total, power, per_share, limit, held_qty, buy_cfg):
+    """三个上限各自最多能买多少股（碎股精确到 0.0001 股）。"""
+    frac = buy_cfg.get("fractional", True)
+    unit = (lambda x: math.floor(max(0.0, x) * 10000) / 10000) if frac else (lambda x: int(max(0.0, x)))
+    by_risk = unit(total * buy_cfg["risk_pct"] / 100 / per_share) if per_share > 0 else 0
+    by_pos = unit((total * buy_cfg["max_pos_pct"] / 100 - held_qty * limit) / limit)
+    by_cash = unit(power * 0.99 / limit)
+    least = orders.MIN_FRAC_USD / limit if frac else 1
+    return unit, by_risk, by_pos, by_cash, least
+
+
+def _dip_plan(code, quote, rows, acct, held_qty, buy_cfg, pending_codes):
+    d = risk.DIP
+    out = {"code": code, "name": quote.get("name", code), "ok": False, "reasons": [], "checks": [], "style": "dip"}
+    price = quote.get("price")
+    if not price or len(rows) < 30:
+        out["reasons"].append("拿不到现价或历史数据")
+        return out
+    ok, checks, m = risk.dip_setup(rows, price)
+    out["checks"] += checks
+    if not ok:
+        out["reasons"].append(f"不满足回调抄底条件（需要站上 200 日线、并从 20 日高点回落 ≥ {d['pullback']:g} ATR）")
+    if code in pending_codes:
+        out["reasons"].append("这只股票已有未成交的买单")
+    total = (acct or {}).get("total_assets") or 0
+    power = (acct or {}).get("power") or 0
+    if not total:
+        out["reasons"].append("读不到账户总资产（OpenD 是否已连接？）")
+    a = risk.atr(rows)
+    limit = round(price * 1.002, 2)
+    stop = round(limit - d["stop"] * a, 2)
+    per_share = limit - stop
+    unit, by_risk, by_pos, by_cash, least = _sizes(total, power, per_share, limit, held_qty, buy_cfg)
+    full = min(by_risk, by_pos)          # 两批合计的上限
+    first = min(unit(full / 2), by_cash)  # 第一批：一半，且不超过购买力
+    out["checks"] += [(f"两批合计：按风险最多 {by_risk:g} 股、按仓位最多 {by_pos:g} 股 → {full:g} 股", full >= least),
+                      (f"第一批半仓 {unit(full / 2):g} 股，购买力最多 {by_cash:g} 股 → {first:g} 股", first >= least)]
+    if total and first < least:
+        out["reasons"].append(f"算出来的第一批不够 {'$' + format(orders.MIN_FRAC_USD, 'g') + ' 的碎股' if buy_cfg.get('fractional', True) else '1 股'}"
+                              f"（购买力 ${power:,.2f}）")
+        first = 0
+    add_px = round(limit - d["add"] * a, 2)
+    out.update(price=price, limit=limit, stop=stop, target=None, atr=a, qty=first, per_share=per_share,
+               cost=first * limit, max_loss=2 * first * per_share,
+               max_loss_pct=2 * first * per_share / total * 100 if total else None,
+               add_px=add_px, add_qty=first, exit_ma=d["exit_ma"], max_days=d["max_days"], **m)
     out["ok"] = not out["reasons"]
     return out
 

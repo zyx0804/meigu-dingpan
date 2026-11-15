@@ -159,7 +159,7 @@ def main(open_browser=True):
             socket.create_connection(("127.0.0.1", LOCK_PORT), timeout=2).close()
         except OSError:
             pass
-        print("盯盘程序已经在运行。若弹出的是桌面版窗口，请先关掉桌面版再运行网页版。")
+        print("牛来已经在运行。若弹出的是桌面版窗口，请先关掉桌面版再运行网页版。")
         return
     from engine import Engine
     import updater
