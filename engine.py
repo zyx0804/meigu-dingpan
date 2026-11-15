@@ -16,6 +16,7 @@ import orders
 import risk
 import rules
 import screener
+import shadow
 import tuner
 from common import (DATA, ENV_NAME, INDICES, fetch, fetch_daily, last_session, load, market_open, normalize, save, us_date,
                     us_now)
@@ -45,6 +46,8 @@ class Engine:
             self.cfg["push"] = {"enabled": False, "server": notify.DEFAULT_SERVER, "topic": notify.new_topic()}
             save(self.cfg)
         self.push = notify.Pusher(self.cfg["push"])
+        self._spx = (None, [])  # 标普日 K（看大盘用），一天拉一次
+        self.apply_profile()
         self._down_since, self._down_alerted, self._unlock_err = None, False, 0
         self.check_result = None
         self.acct, self.positions = None, []
@@ -234,6 +237,36 @@ class Engine:
                     self.log(f"离场信号 · {p['name']}({c})：{sig}（现价 {price}）", alert=True)
         self.reports = reports
 
+    # ---------- 档位：保守 / 均衡 / 激进 ----------
+    def profile(self):
+        p = self.cfg.get("profile", "balanced")
+        return p if p in shadow.PROFILES else "balanced"
+
+    def dip_params(self, profile=None):
+        p = profile or self.profile()
+        return {**shadow.PROFILES[p]["params"], **self.cfg.get("dip_over", {}).get(p, {})}
+
+    def apply_profile(self):
+        """把当前档位的买卖参数装进 risk.DIP（买入计划、选股、卖出规则都读它）。"""
+        risk.DIP.update(self.dip_params())
+
+    def market_healthy(self):
+        """大盘（标普 500）收盘在 200 日线上方。拿不到数据时按健康处理，不因为断网就停手。"""
+        today = us_date()
+        if self._spx[0] != today:
+            try:
+                self._spx = (today, fetch_daily(".INX", 260))
+            except Exception:
+                return True
+        rows = self._spx[1]
+        if len(rows) < 200:
+            return True
+        return rows[-1][2] > sum(r[2] for r in rows[-200:]) / 200
+
+    def market_blocks(self):
+        """当前档位要看大盘、而大盘在 200 日线下方：暂停抄底。"""
+        return shadow.PROFILES[self.profile()]["market"] and not self.market_healthy()
+
     # ---------- 回调抄底 + 分批 ----------
     def style_of(self, code):
         """这只持仓按哪套规则管：有抄底规则就是 dip；有旧规则（没标 style）就是 trend；还没规则就按当前策略。"""
@@ -268,7 +301,8 @@ class Engine:
             entry, a0 = b.get("entry") or today, b.get("atr0") or risk.atr(rows)
             if b.get("half_sold"):
                 high = max([r[3] for r in rows if r[0] >= entry] + [px])
-                dyn[b["id"]] = max(b.get("stop0", 0), b.get("cost", 0) * 1.001, high - d["trail"] * a0)
+                dyn[b["id"]] = max(b.get("stop0", 0), b.get("cost", 0) * 1.001,
+                                   high - d["trail"] * a0 if d["trail"] else 0)
             if not closing:
                 continue
             days = self._days_held(rows, entry)
@@ -278,7 +312,9 @@ class Engine:
                 acts[b["id"]] = "all"
                 b["exit_why"] = f"持有满 {d['max_days']} 个交易日"
             elif not b.get("half_sold") and days >= 1 and px > ma:
-                acts[b["id"]] = "half"
+                acts[b["id"]] = "half" if d["add"] else "all"
+                if not d["add"]:
+                    b["exit_why"] = f"收盘站上 {d['exit_ma']} 日线"
         return dyn, acts
 
     def dip_addons(self):
@@ -413,6 +449,9 @@ class Engine:
                 self.cfg[key] = bool(value)
             elif key == "strategy" and value in ("dip", "trend"):
                 self.cfg["strategy"] = value
+            elif key == "profile" and value in shadow.PROFILES:
+                self.cfg["profile"] = value
+                risk.DIP.update(self.dip_params(value))
             elif key == "fractional":
                 self.cfg["buy"]["fractional"] = bool(value)
             elif key == "push_enabled":
@@ -460,6 +499,8 @@ class Engine:
             protected = set(INDICES) | {p["code"] for p in self.positions} | set(self.cfg["locked"])
             add, remove = screener.plan_changes(ranked, self.cfg["stocks"], protected, set(self.cfg["ignore"]),
                                                 self.cfg.get("strategy", "dip"))
+            if self.cfg.get("strategy", "dip") == "dip" and self.market_blocks():
+                add = []  # 保守档位：大盘不好时不往自选里加抄底候选
             for c in remove:
                 for key in ("auto", "stocks"):
                     if c in self.cfg[key]:
@@ -496,7 +537,8 @@ class Engine:
     def _backtest(self, today):
         try:
             codes = list(dict.fromkeys([p["code"] for p in self.positions] +
-                                       [c for c in self.cfg["stocks"] if c not in INDICES]))
+                                       [c for c in self.cfg["stocks"] if c not in INDICES] +
+                                       ["us" + c for c in screener.UNIVERSE]))  # 影子交易用整个股票池
             q = fetch(codes)
             data = {}
             for c in codes:
@@ -511,6 +553,10 @@ class Engine:
                 self.cfg["bt"] = {"date": today, "k": backtest.best_trail_k(res), "stocks": len(data), "results": res}
                 save(self.cfg)
             try:
+                self._shadow(data)
+            except Exception as e:
+                self.log(f"影子交易失败：{str(e)[:80]}")
+            try:
                 self._learn(data, q)
             except Exception as e:
                 self.log(f"交易复盘失败：{str(e)[:80]}")
@@ -519,6 +565,53 @@ class Engine:
             self.log(f"回测失败：{e}")
         finally:
             self.backtesting = False
+
+    def _shadow(self, data):
+        """影子交易：所有候选规则按真实日 K 假装交易（不下单），只统计开始记录之后买入的；每月按结果升级档位参数。"""
+        sh = self.cfg.setdefault("shadow", {})
+        sh.setdefault("start", us_date())
+        spx = fetch_daily(".INX", 520)
+        results = shadow.evaluate(data, spx, sh["start"])
+        with self.lock:
+            self.cfg["shadow"] = {**sh, "date": last_session(), "results": results}
+            save(self.cfg)
+        month = last_session()[:7]
+        if self.cfg.get("dip_month") == month or market_open(10):
+            return
+        self.cfg["dip_month"] = month
+        changed = []
+        for prof, info in shadow.PROFILES.items():
+            cur = self.dip_params(prof)
+            best = shadow.pick_upgrade(results, prof, cur)
+            if not best:
+                continue
+            with self.lock:
+                self.cfg["dip_history"].append({"profile": prof, "old": cur, "new": best["params"], "name": best["name"],
+                                                "date": us_date()})
+                self.cfg.setdefault("dip_over", {})[prof] = dict(best["params"])
+            s = best["shadow"]
+            changed.append(f"{info['name']}档位换成「{best['name']}」（影子交易 {s['trades']} 笔，平均每笔 {s['avg']:+.2f}%）")
+        self.apply_profile()
+        self.save()
+        if changed:
+            self.log("自动学习升级：" + "；".join(changed) + "。不满意可在「复盘」页退回", order=True, alert=True)
+        else:
+            self.log(f"{month} 自动学习：影子交易里还没有同时跑赢当前规则的候选，三个档位都不变")
+
+    def dip_rollback(self, profile):
+        with self.lock:
+            hist = [h for h in self.cfg["dip_history"] if h["profile"] == profile]
+            if not hist:
+                raise ValueError("这个档位没有升级过，不用退回")
+            last = hist[-1]
+            self.cfg["dip_history"].remove(last)
+            if last["old"] == shadow.PROFILES[profile]["params"]:
+                self.cfg["dip_over"].pop(profile, None)
+            else:
+                self.cfg["dip_over"][profile] = last["old"]
+            save(self.cfg)
+        self.apply_profile()
+        self.log(f"{shadow.PROFILES[profile]['name']}档位已退回升级前的参数", order=True)
 
     def _learn(self, data, q):
         if not self.link.trd:
@@ -669,9 +762,20 @@ class Engine:
         rows = fetch_daily(q["symbol"], 260 if style == "dip" else 130)
         held = sum(p["qty"] for p in self.positions if p["code"] == code and p["side"] == "long")
         pending = {b["code"] for b in self.cfg["pending_buys"] if b["status"] == "pending"}
-        plan = rules.buy_plan(code, q, rows, self.acct, held, self.cfg["buy"], self.cfg["rule_params"], pending, style)
-        plan["rules"] = (rules.dip_rules_text(self.cfg["buy"]) if style == "dip"
-                         else rules.buy_rules_text(self.cfg["buy"], self.cfg["rule_params"]))
+        buy_cfg = self.cfg["buy"]
+        if style == "dip":  # 抄底时单笔风险按档位
+            buy_cfg = {**buy_cfg, "risk_pct": shadow.PROFILES[self.profile()]["risk_pct"]}
+        plan = rules.buy_plan(code, q, rows, self.acct, held, buy_cfg, self.cfg["rule_params"], pending, style)
+        plan["rules"] = (rules.dip_rules_text(buy_cfg) if style == "dip"
+                         else rules.buy_rules_text(buy_cfg, self.cfg["rule_params"]))
+        if style == "dip":
+            prof = shadow.PROFILES[self.profile()]
+            plan["profile"] = prof["name"]
+            if prof["market"]:
+                plan["rules"].insert(1, "看大盘：标普 500 收盘在 200 日线下方时暂停抄底")
+                if not self.market_healthy():
+                    plan.update(ok=False, qty=0)
+                    plan["reasons"].append(f"{prof['name']}档位：大盘（标普 500）在 200 日线下方，暂停抄底")
         plan["screen"] = self.cfg["screen"].get(code)
         if plan["ok"] and not float(plan["qty"]).is_integer() and not market_open():
             # 碎股只能在常规交易时段下单：盘外只按整数股算，不够 1 股就等开盘
@@ -727,7 +831,8 @@ class Engine:
             raise ValueError(msg)
         with self.lock:
             dip = {"style": "dip", "stop0": plan["stop"], "atr0": plan["atr"], "entry": us_date(),
-                   "add": {"px": plan["add_px"], "qty": qty, "done": False}} if plan.get("style") == "dip" else {}
+                   **({"add": {"px": plan["add_px"], "qty": qty, "done": False}} if plan.get("add_px") else {})
+                   } if plan.get("style") == "dip" else {}
             self.cfg["pending_buys"].append({"order_id": oid, "code": plan["code"], "name": plan["name"], "qty": qty,
                                              "limit": plan["limit"], "status": "pending", **dip,
                                              "created": datetime.now().strftime("%Y-%m-%d %H:%M")})
@@ -1024,7 +1129,7 @@ class Engine:
                 "pending_buys": [b for b in cfg["pending_buys"] if b["status"] == "pending"],
                 "settings": {"mode": cfg["mode"], "modes": {k: v[0] for k, v in risk.MODES.items()},
                              "auto_screen": cfg["auto_screen"], "auto_protect": cfg.get("auto_protect", True), "buy": cfg["buy"],
-                             "strategy": cfg.get("strategy", "dip"),
+                             "strategy": cfg.get("strategy", "dip"), "profile": self.profile(),
                              "push": {**cfg["push"], **self.push.status}, "check": self.check_result,
                              "rule_params": cfg["rule_params"]},
                 "screening": self.screening, "backtesting": self.backtesting,
@@ -1034,4 +1139,9 @@ class Engine:
     def journal_state(self):
         return {"journal": self.cfg["journal"], "rule_params": self.cfg["rule_params"],
                 "rule_history": self.cfg["rule_history"][-5:], "suggestion": self.cfg["suggestion"],
-                "bt": self.cfg["bt"], "rule_month": self.cfg.get("rule_month")}
+                "bt": self.cfg["bt"], "rule_month": self.cfg.get("rule_month"),
+                "profiles": {k: {"name": v["name"], "risk_pct": v["risk_pct"], "market": v["market"],
+                                 "params": self.dip_params(k), "upgraded": k in self.cfg.get("dip_over", {})}
+                             for k, v in shadow.PROFILES.items()},
+                "profile": self.profile(), "dip_history": self.cfg.get("dip_history", [])[-6:],
+                "shadow": self.cfg.get("shadow", {})}

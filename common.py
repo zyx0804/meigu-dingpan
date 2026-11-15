@@ -35,6 +35,10 @@ DEFAULT = {
     "buy": {"risk_pct": 2.0, "max_pos_pct": 50.0, "fractional": True},  # fractional：允许买碎股
     "pending_buys": [],   # 已下单、等待成交的买单（成交后自动挂止损）
     "strategy": "dip",    # 买卖策略：dip 回调抄底 + 分批（默认）/ trend 追涨（旧规则）
+    "profile": "balanced",  # 抄底档位：conservative 保守 / balanced 均衡 / aggressive 激进
+    "dip_over": {},       # 每月升级换上的参数：档位 -> 参数
+    "dip_history": [],    # 升级记录（可以退回）
+    "shadow": {},         # 影子交易：{start 开始记录日期, date, results}
     "auto_protect": True,  # 没有被规则保护的持仓（比如在 moomoo App 里买的）自动挂止损 + 止盈
 }
 INDICES = ("usDJI", "usIXIC", "usINX")
