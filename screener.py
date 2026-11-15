@@ -31,6 +31,21 @@ KLINE_URLS = [
 _good = [0]  # 上次成功的接口下标，下次优先用
 
 
+def adjust_splits(rows):
+    """有的接口给的日 K 没复权：拆股那天看起来像暴跌（如一拆十跌 90%），均线、ATR、止损都会算错。
+    开盘比前一天收盘低到一半以下、且接近整数倍时按拆股处理，把之前的价格和成交量换算到拆股后。"""
+    rows = [list(r) for r in rows]
+    for j in range(1, len(rows)):
+        ratio = rows[j - 1][2] / rows[j][1] if rows[j][1] else 0
+        k = round(ratio)
+        if ratio > 1.8 and abs(ratio - k) / k < 0.12:
+            for t in range(j):
+                rows[t][1:5] = [x / k for x in rows[t][1:5]]
+                if len(rows[t]) > 5:
+                    rows[t][5] *= k
+    return [tuple(r) for r in rows]
+
+
 def kline(symbol, n=60):
     """日 K [(日期, 开, 收, 高, 低, 量)]。symbol 带交易所后缀，如 AAPL.OQ。"""
     err = None
@@ -42,13 +57,51 @@ def kline(symbol, n=60):
             rows = v.get("qfqday") or v.get("day") or []
             if rows:
                 _good[0] = i
-                return [(r[0], float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])) for r in rows]
+                return adjust_splits([(r[0], float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]))
+                                      for r in rows])
         except Exception as e:
             err = e
     raise RuntimeError(f"日 K 获取失败：{err}")
 
 
 fetch_daily_vol = kline
+
+
+def dip_metrics(rows):
+    """回调抄底用的指标：200 日线、从 20 日高点回落了几个 ATR。数据不足返回 None。"""
+    m = metrics(rows)
+    if not m or len(rows) < 200:
+        return None
+    closes = [r[2] for r in rows]
+    trs = [max(h - l, abs(h - rows[i - 1][2]), abs(l - rows[i - 1][2]))
+           for i, (_, _, _, h, l, _) in enumerate(rows) if i > 0][-14:]
+    a = sum(trs) / len(trs)
+    ma200 = statistics.mean(closes[-200:])
+    high20 = max(r[3] for r in rows[-20:])
+    return {**m, "ma200": ma200, "above200": m["close"] > ma200, "trend200": m["close"] / ma200 - 1,
+            "pullback_atr": (high20 - m["close"]) / a if a else 0}
+
+
+def score_dip(data):
+    """回调抄底打分：回落深度 50、长期趋势强度 30、成交额 20。符合条件：站上 200 日线且回落 ≥ 2.5 ATR。"""
+    items = [(c, m) for c, m in data.items() if m and m["dollar_vol"] >= MIN_DOLLAR_VOL]
+    if not items:
+        return []
+    pb = _pct_rank([m["pullback_atr"] for _, m in items])
+    tr = _pct_rank([m["trend200"] for _, m in items])
+    dv = _pct_rank([m["dollar_vol"] for _, m in items])
+    out = []
+    for i, (code, m) in enumerate(items):
+        ok = m["above200"] and m["pullback_atr"] >= 2.5
+        reasons = [f"从 20 日高点回落 {m['pullback_atr']:.1f} ATR",
+                   f"{'站上' if m['above200'] else '跌破'} 200 日线（{m['trend200'] * 100:+.1f}%）",
+                   f"5日 {m['ret5'] * 100:+.1f}%", f"日均波动 {m['atr_pct']:.1f}%"]
+        out.append({"code": code, "score": round(50 * pb[i] + 30 * tr[i] + 20 * dv[i], 1), "eligible": ok,
+                    "reason": "，".join(reasons), **m})
+    out.sort(key=lambda x: (not x["eligible"], -x["score"]))
+    for rank, x in enumerate(out, 1):
+        x["rank"] = rank
+    return out
 
 
 def metrics(rows):
@@ -103,23 +156,32 @@ def score_all(data):
     return out
 
 
-def run(symbols):
-    """symbols: 代码 -> 腾讯带后缀的 symbol（如 usAAPL -> AAPL.OQ）。并发拉日 K 后打分。"""
+def run(symbols, style="trend"):
+    """symbols: 代码 -> 腾讯带后缀的 symbol（如 usAAPL -> AAPL.OQ）。并发拉日 K 后打分。
+    style：trend 追涨打分 / dip 回调抄底打分（要 200 日线，多拉一些日 K）。"""
     def one(item):
         code, sym = item
         try:
+            if style == "dip":
+                return code, dip_metrics(fetch_daily_vol(sym, 260))
             return code, metrics(fetch_daily_vol(sym))
         except Exception:
             return code, None
     with ThreadPoolExecutor(max_workers=4) as ex:  # 并发别太高，免得被限流
         data = dict(ex.map(one, symbols.items()))
-    return score_all(data)
+    return score_dip(data) if style == "dip" else score_all(data)
 
 
-def why_remove(x):
+def why_remove(x, style="trend"):
     """这只股票为什么被清掉；还够格返回 None。x 为 None 表示拿不到数据。"""
     if x is None:
         return "拿不到行情数据"
+    if style == "dip":
+        if not x["above200"]:
+            return "跌破 200 日线，长期趋势坏了"
+        if x["pullback_atr"] < 2.5:
+            return f"已经反弹（离 20 日高点只差 {x['pullback_atr']:.1f} ATR），不在回调区"
+        return None
     if not x["above20"]:
         return f"跌破 20 日线（评分 {x['score']}）"
     if x["ret20"] <= 0:
@@ -129,7 +191,7 @@ def why_remove(x):
     return None
 
 
-def plan_changes(ranked, watchlist, protected, skip_add=()):
+def plan_changes(ranked, watchlist, protected, skip_add=(), style="trend"):
     """决定今天清掉哪些、加入哪些。
     watchlist：当前自选；protected：指数、持仓、你锁定的，永远不动；skip_add：7 天内你手动删过的，不自动加回。
     返回 (加入列表, {移除代码: 原因})。"""
@@ -137,7 +199,7 @@ def plan_changes(ranked, watchlist, protected, skip_add=()):
     remove = {}
     for c in watchlist:
         if c not in protected:
-            reason = why_remove(by_code.get(c))
+            reason = why_remove(by_code.get(c), style)
             if reason:
                 remove[c] = reason
     keep = [c for c in watchlist if c not in protected and c not in remove]

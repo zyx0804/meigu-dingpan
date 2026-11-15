@@ -19,7 +19,7 @@ class BracketManager:
         """store：持久化的规则列表（存在 stocks.json 里）；log(msg, alert=False)：写日志，alert=True 的会响铃并推送到手机。"""
         self.desk, self.store, self.log = desk, store, log
 
-    def create(self, stop_spec, target_spec, env, server_target=True):
+    def create(self, stop_spec, target_spec, env, server_target=True, extra=None):
         """先挂止损，再尝试挂止盈（target_spec 可以为 None：只有止损，程序负责自动跟踪）。
         server_target=False：止盈不挂到服务器，直接由程序盯价（现金账户用：服务器止盈单可能在资金交收前成交而违规）。
         返回 (规则, 结果说明列表)。"""
@@ -29,7 +29,7 @@ class BracketManager:
         b = {"id": f"R{time.strftime('%m%d%H%M%S')}-{len(self.store) + 1}", "env": env, "code": stop_spec["code"], "qty": stop_spec["qty"],
              "side": stop_spec["trd_side"], "stop_id": stop_id, "stop_desc": stop_spec,
              "target": target_spec["price"] if target_spec else None, "target_id": None, "mode": "server",
-             "status": "active", "ratchet": True, "created": time.strftime("%Y-%m-%d %H:%M")}
+             "status": "active", "ratchet": True, "created": time.strftime("%Y-%m-%d %H:%M"), **(extra or {})}
         if stop_spec["order_type"] in ("STOP", "STOP_LIMIT"):
             notes.append("· 固定止损会跟着动态止损自动上调（只升不降），每次调整都写进日志")
         if target_spec and not server_target:
@@ -48,12 +48,13 @@ class BracketManager:
         self.log(f"建立规则 {b['id']} {b['code']} {b['qty']} 股：止损单 {stop_id}，{tgt}")
         return b, notes
 
-    def create_local(self, stop_spec, target_spec, env):
+    def create_local(self, stop_spec, target_spec, env, extra=None):
         """碎股：moomoo 不支持给碎股挂止损单，止损和止盈都由程序盯价，到价时限价卖出。不在服务器上挂任何单。"""
         b = {"id": f"R{time.strftime('%m%d%H%M%S')}-{len(self.store) + 1}", "env": env, "code": stop_spec["code"],
              "qty": stop_spec["qty"], "side": stop_spec["trd_side"], "stop_id": None, "stop_local": True,
              "stop_desc": stop_spec, "target": target_spec["price"] if target_spec else None, "target_id": None,
-             "mode": "local", "status": "active", "ratchet": True, "created": time.strftime("%Y-%m-%d %H:%M")}
+             "mode": "local", "status": "active", "ratchet": True, "created": time.strftime("%Y-%m-%d %H:%M"),
+             **(extra or {})}
         self.store.append(b)
         tgt = f"止盈 {b['target']}" if b["target"] else "无止盈"
         note = (f"碎股 {b['qty']:g} 股：moomoo 不支持碎股止损单，止损 {stop_spec['aux_price']}、{tgt} 都由程序盯价，"
@@ -71,12 +72,13 @@ class BracketManager:
         b["status"] = "cancelled"
         self.log(f"规则 {b['id']} 已手动停止，相关挂单已撤")
 
-    def tick(self, prices, held, dyn_stops=None, targets=None, rth=True, hold=()):
+    def tick(self, prices, held, dyn_stops=None, targets=None, rth=True, hold=(), actions=None):
         """后台定时调用。prices：代码(usXXX) -> 现价；held(env, usXXX) -> 持仓数；
         dyn_stops：代码 -> 程序算出的动态止损价，用来自动上调固定止损单；
         targets：代码 -> 按当前规则算出的止盈价（程序盯价的规则会跟着更新，没有止盈的会补上）；
         rth：是否在常规交易时段。盘前盘后、夜盘不触发止盈（不在那时撤掉止损）；
-        hold：今天不能止盈卖出的代码（现金账户当天买入的，T+1）。止损单在服务器上，不受影响。"""
+        hold：今天不能止盈卖出的代码（现金账户当天买入的，T+1）。止损单在服务器上，不受影响；
+        actions：规则 id -> "half"（卖一半）/ "all"（全卖），抄底规则收盘前由引擎算好传进来。"""
         for b in [x for x in self.store if x["status"] == "active"]:
             try:
                 local = "us" + b["code"].split(".", 1)[1]
@@ -88,19 +90,91 @@ class BracketManager:
                             self.log(f"规则 {b['id']} 按当前规则补上止盈 {tp}（程序盯价）")
                         b.update(target=tp, mode="local")
                 self._tick_one(b, prices, held, rth, local in hold)
+                act = (actions or {}).get(b["id"])
+                if act and b["status"] == "active" and not b.get("phase") and rth and local not in hold:
+                    self._dip_exit(b, prices.get(local), act)
                 if b["status"] == "active" and b.get("ratchet", True) and dyn_stops:
                     self._ratchet(b, prices, dyn_stops)
             except Exception as e:
                 self.log(f"规则 {b['id']} 检查出错（下次重试）：{str(e)[:80]}")
 
+    def _dip_exit(self, b, px, act):
+        """抄底规则的分批卖：half 先卖一半（服务器止损单先改成剩下的股数，腾出要卖的那一半）；all 全部卖出。"""
+        if not px:
+            return
+        env, q = b["env"], b["qty"]
+        if act == "half":
+            sell = (q // 2) if float(q).is_integer() else round(q / 2, 4)
+            if sell * px < 1 or (float(q).is_integer() and sell < 1):
+                act = "all"  # 只有 1 股或金额太小，分不了：直接全卖落袋
+        limit = round(px * 0.995, 2)
+        if act == "all":
+            if not b.get("stop_local"):
+                self.desk.cancel(b["stop_id"], env)
+                if self.desk.order_status(b["stop_id"], env) not in DEAD:
+                    return  # 止损还没撤掉，下一轮再试，避免两边都卖
+            spec = {"order_type": "NORMAL", "aux_price": None, "price": limit, "code": b["code"], "qty": q,
+                    "trd_side": b["side"], "kind": "exit", "time_in_force": "DAY", "session": "RTH"}
+            try:
+                b["exit_id"] = self.desk.place(spec, env)
+            except Exception as e:
+                if not b.get("stop_local"):
+                    b["stop_id"] = self.desk.place(b["stop_desc"], env)
+                self.log(f"规则 {b['id']} 抄底离场卖单失败（{str(e)[:60]}），止损照旧", alert=True)
+                return
+            b["phase"] = "dip_all"
+            self.log(f"规则 {b['id']} 抄底离场：{b.get('exit_why', '')} 限价 {limit} 卖出全部 {q:g} 股，订单号 {b['exit_id']}",
+                     alert=True)
+            return
+        rest = round(q - sell, 6)
+        if not b.get("stop_local"):
+            sd = b["stop_desc"]
+            self.desk.modify_stop(b["stop_id"], env, rest, sd["aux_price"], sd["price"])  # 改不了就抛错，下一轮再试
+        spec = {"order_type": "NORMAL", "aux_price": None, "price": limit, "code": b["code"], "qty": sell,
+                "trd_side": b["side"], "kind": "exit", "time_in_force": "DAY", "session": "RTH"}
+        try:
+            b["exit_id"] = self.desk.place(spec, env)
+        except Exception as e:
+            if not b.get("stop_local"):
+                self.desk.modify_stop(b["stop_id"], env, q, b["stop_desc"]["aux_price"], b["stop_desc"]["price"])
+            self.log(f"规则 {b['id']} 卖一半失败（{str(e)[:60]}），止损恢复成 {q:g} 股", alert=True)
+            return
+        b.update(phase="dip_half", sell_qty=sell)
+        self.log(f"规则 {b['id']} 收盘站上 10 日线，先卖一半落袋：限价 {limit} 卖出 {sell:g} 股，订单号 {b['exit_id']}；"
+                 f"剩下 {rest:g} 股之后至少保本 + 跟踪", alert=True)
+
+    def _dip_phase(self, b, held):
+        """抄底规则卖单的后续：成交就更新股数 / 结束；没成交（收盘过期）就恢复原样，第二天再判断。"""
+        env, phase = b["env"], b["phase"]
+        st = self.desk.order_status(b["exit_id"], env)
+        if phase == "dip_half":
+            if st in DONE:
+                b.update(qty=round(b["qty"] - b["sell_qty"], 6), half_sold=True, phase=None, exit_id=None)
+                self.log(f"规则 {b['id']} 一半已卖出，剩下 {b['qty']:g} 股：止损提到至少保本，并开始跟踪", alert=True)
+            elif st in DEAD:
+                if not b.get("stop_local"):
+                    sd = b["stop_desc"]
+                    self.desk.modify_stop(b["stop_id"], env, b["qty"], sd["aux_price"], sd["price"])
+                b.update(phase=None, exit_id=None)
+                self.log(f"规则 {b['id']} 卖一半的单没成交（{st}），止损已恢复成 {b['qty']:g} 股，明天收盘前再看", alert=True)
+        elif phase == "dip_all":
+            if st in DONE:
+                b["status"] = "done"
+                self.log(f"规则 {b['id']} 抄底离场卖单已成交，规则结束", alert=True)
+            elif st in DEAD:
+                if not b.get("stop_local"):
+                    b["stop_id"] = self.desk.place(b["stop_desc"], env)
+                b.update(phase=None, exit_id=None)
+                self.log(f"规则 {b['id']} 离场卖单没成交（{st}），已重新挂回止损，明天收盘前再卖", alert=True)
+
     def _ratchet(self, b, prices, dyn_stops):
         """固定止损单跟着动态止损往有利方向移：做多只上调、做空只下调，永远不放宽。
         跟踪止损单由 moomoo 服务器自己跟踪，不需要改。"""
         sd = b["stop_desc"]
-        if sd["order_type"] not in ("STOP", "STOP_LIMIT") or b.get("phase") in ("selling", "stopping"):
+        if sd["order_type"] not in ("STOP", "STOP_LIMIT") or b.get("phase"):
             return
         local = "us" + b["code"].split(".", 1)[1]
-        new, px = dyn_stops.get(local), prices.get(local)
+        new, px = dyn_stops.get(b["id"], dyn_stops.get(local)), prices.get(local)  # 抄底规则按规则 id 单独算
         if not new or not px:
             return
         long = b["side"] == "SELL"
@@ -155,6 +229,8 @@ class BracketManager:
         self.log(f"规则 {b['id']} 价格 {px} {why}：限价 {limit} 卖出 {b['qty']:g} 股，订单号 {b['exit_id']}", alert=True)
 
     def _tick_one(self, b, prices, held, rth=True, t1=False):
+        if b.get("phase") in ("dip_half", "dip_all"):
+            return self._dip_phase(b, held)
         if b.get("stop_local"):
             return self._tick_local(b, prices, held, rth, t1)
         env, local = b["env"], "us" + b["code"].split(".", 1)[1]
