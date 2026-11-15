@@ -5,6 +5,8 @@
 """
 import json
 import statistics
+
+import risk
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
@@ -92,7 +94,7 @@ def score_dip(data):
     dv = _pct_rank([m["dollar_vol"] for _, m in items])
     out = []
     for i, (code, m) in enumerate(items):
-        ok = m["above200"] and m["pullback_atr"] >= 2.5
+        ok = m["above200"] and m["pullback_atr"] >= risk.DIP["pullback"]
         reasons = [f"从 20 日高点回落 {m['pullback_atr']:.1f} ATR",
                    f"{'站上' if m['above200'] else '跌破'} 200 日线（{m['trend200'] * 100:+.1f}%）",
                    f"5日 {m['ret5'] * 100:+.1f}%", f"日均波动 {m['atr_pct']:.1f}%"]
@@ -179,7 +181,7 @@ def why_remove(x, style="trend"):
     if style == "dip":
         if not x["above200"]:
             return "跌破 200 日线，长期趋势坏了"
-        if x["pullback_atr"] < 2.5:
+        if x["pullback_atr"] < risk.DIP["pullback"]:
             return f"已经反弹（离 20 日高点只差 {x['pullback_atr']:.1f} ATR），不在回调区"
         return None
     if not x["above20"]:

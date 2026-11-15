@@ -164,6 +164,8 @@ function vBuy(){const b=S.settings.buy;
    <label class="sub">策略 <select onchange="setOpt('strategy',this.value).then(()=>{buyPlan=null;toast('已切换，重新点「按规则计算」');render(true)})">
      <option value="dip" ${S.settings.strategy==="dip"?"selected":""}>回调抄底 + 分批</option>
      <option value="trend" ${S.settings.strategy==="trend"?"selected":""}>追涨（旧规则）</option></select></label>
+   <label class="sub">档位 <select onchange="setOpt('profile',this.value).then(()=>{buyPlan=null;J=null;toast('已切换档位，重新点「按规则计算」');render(true)})">
+     ${[["conservative","保守（单笔亏 1%，看大盘）"],["balanced","均衡（单笔亏 2%）"],["aggressive","激进（单笔亏 3%）"]].map(([k,v])=>`<option value="${k}" ${S.settings.profile===k?"selected":""}>${v}</option>`).join("")}</select></label>
    <span class="sub" style="margin-left:12px">单笔最多亏总资产 <input id="rp" value="${b.risk_pct}" size="3">% · 单只最多占总资产 <input id="mp" value="${b.max_pos_pct}" size="3">%</span>
    <button onclick="setOpt('risk_pct',$('rp').value).then(()=>setOpt('max_pos_pct',$('mp').value)).then(()=>toast('已保存'))">保存</button></div>
   <div id="bplan"></div>
@@ -202,9 +204,18 @@ async function cancelAll(){if(!S.orders.length)return toast("没有挂单");if(!
 async function stopRule(){const r=S.rules.find(x=>x.id===sel.r);if(!r||!r.active)return toast("先选中一条运行中的规则");if(!confirm("停止规则 "+r.id+" 并撤销它的挂单？"))return;await act("/api/rule/stop",{id:r.id});toast("已停止")}
 
 let J=null,jT=0;
+function learnBox(){const P=J.profiles||{},sh=J.shadow||{},R=sh.results||[];
+  const pr=p=>`回落 ${p.pullback} ATR 买 · 止损 ${p.stop} ATR · ${p.add?"再跌 "+p.add+" ATR 补仓":"不分批"} · ${p.exit_ma} 日线${p.add?"卖一半":"全卖"}${p.trail?" · 跟踪 "+p.trail+" ATR":""} · 最多 ${p.max_days} 天`;
+  const row=r=>{const s=r.shadow||{},b=r.backtest||{};return `<tr><td>${esc(r.name)}</td><td class="sub">${r.profiles.map(k=>(P[k]||{}).name||k).join("/")}</td>
+   <td>${s.trades||0}</td><td>${s.trades?n(s.win,0)+"%":"-"}</td><td class="${sgn(s.avg)}">${s.trades?n(s.avg)+"%":"-"}</td><td>${s.trades?n(s.worst,1)+"%":"-"}</td>
+   <td>${b.trades||0}</td><td class="${sgn(b.avg)}">${b.trades?n(b.avg)+"%":"-"}</td><td>${b.trades?n(b.worst,1)+"%":"-"}</td></tr>`};
+  return `<div class="box"><h3>自动学习 · 三个档位</h3>${Object.entries(P).map(([k,v])=>`<p><b>${esc(v.name)}${k===J.profile?"（正在用）":""}</b> 单笔最多亏 ${v.risk_pct}%${v.market?" · 大盘跌破 200 日线暂停":""}${v.upgraded?' · <span class="up">已升级</span> <button onclick="if(confirm(\'退回这个档位升级前的参数？\'))act(\'/api/dip/rollback\',{profile:\''+k+'\'}).then(()=>{J=null;render(true)})">退回</button>':""}<br><span class="sub">${pr(v.params)}</span></p>`).join("")}
+   ${(J.dip_history||[]).slice().reverse().map(h=>`<span class="sub">${esc(h.date)} ${esc((P[h.profile]||{}).name||h.profile)}档位换成「${esc(h.name)}」</span><br>`).join("")}
+   <p class="sub">影子交易：所有候选规则每天收盘后按真实行情「假装交易」（不下单），${sh.start?"从 "+esc(sh.start)+" 开始记录，":""}只算这之后的新交易。每月比较一次：某个候选在影子交易里跑满 30 笔、平均每笔多赚 0.1 个百分点以上、最差一笔不更差，历史回测也不更差，才在对应档位换上。</p>
+   ${R.length?`<table><tr><th>候选规则</th><th>适合档位</th><th>影子笔数</th><th>胜率</th><th>平均</th><th>最差</th><th>回测笔数</th><th>回测平均</th><th>回测最差</th></tr>${R.map(row).join("")}</table>`:'<p class="sub">还没有结果，收盘后自动跑（或点「立即分析」）</p>'}</div>`}
 async function vJournal(){if(!J||Date.now()-jT>15000){J=await api("/api/journal");jT=Date.now()}
   const j=J.journal||{},st=j.stats,rp=J.rule_params,sug=J.suggestion,b=j.base,bt=J.bt||{};
-  $("view").innerHTML=`<div class="box"><h3>当前规则 v${rp.version}${rp.since?"（"+esc(rp.since)+" 起）":""}</h3>相对成本最多亏 ${rp.loss_cap} ATR · 买入后最高点回撤 ${rp.trail} ATR 跟踪 · 浮盈 ${rp.breakeven} ATR 后保本 · 成本 + ${rp.target??"-"} ATR 止盈
+  $("view").innerHTML=learnBox()+`<div class="box"><h3>当前规则 v${rp.version}${rp.since?"（"+esc(rp.since)+" 起）":""}</h3>相对成本最多亏 ${rp.loss_cap} ATR · 买入后最高点回撤 ${rp.trail} ATR 跟踪 · 浮盈 ${rp.breakeven} ATR 后保本 · 成本 + ${rp.target??"-"} ATR 止盈
    ${J.rule_history.slice().reverse().map(h=>`<br><span class="sub">历史 v${h.version}：限亏 ${h.loss_cap} / 跟踪 ${h.trail} / 保本 ${h.breakeven} / 止盈 ${h.target??"无"}（用到 ${esc(h.until)}）</span>`).join("")}
    <div class="bar">${sug?`<button class="acc" onclick="if(confirm('采用新规则？已挂的止损只会按新规则往上调，不会被放宽。'))act('/api/rule/adopt').then(()=>{J=null;render(true)})">采用新规则</button>`:""}
    ${J.rule_history.length?`<button onclick="if(confirm('退回上一版？'))act('/api/rule/rollback').then(()=>{J=null;render(true)})">退回上一版</button>`:""}

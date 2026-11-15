@@ -118,6 +118,8 @@ class Handler(BaseHTTPRequestHandler):
                 e.start_backtest(force=True)
             elif path == "/api/rule/adopt":
                 e.adopt_suggestion()
+            elif path == "/api/dip/rollback":
+                e.dip_rollback(body["profile"])
             elif path == "/api/rule/rollback":
                 e.rollback_rule()
             elif path == "/api/rule/stop":

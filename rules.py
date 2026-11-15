@@ -32,8 +32,11 @@ def dip_rules_text(buy_cfg):
         "只买美股个股，只用限价单，当日有效，只在常规交易时段成交",
         f"回调抄底：长期趋势向上（站上 200 日线），并且从最近 20 天的最高点回落了至少 {d['pullback']:g} 个 ATR",
         f"止损先定好：买入价 − {d['stop']:g} ATR（挂在 moomoo 服务器上，碎股部分由程序盯价）",
-        f"分批买：先买半仓；之后再跌 {d['add']:g} ATR、还没破止损，就自动按同样股数补另一半（限价单，常规时段）",
-        f"分批卖：收盘站上 {d['exit_ma']} 日线先卖一半落袋；剩下的至少保本，并从买入后的最高点回落 {d['trail']:g} ATR 就卖",
+        (f"分批买：先买半仓；之后再跌 {d['add']:g} ATR、还没破止损，就自动按同样股数补另一半（限价单，常规时段）"
+         if d["add"] else "一次买满，不补仓"),
+        (f"分批卖：收盘站上 {d['exit_ma']} 日线先卖一半落袋；剩下的至少保本"
+         + (f"，并从买入后的最高点回落 {d['trail']:g} ATR 就卖" if d["trail"] else "")
+         if d["add"] else f"收盘站上 {d['exit_ma']} 日线全部卖出"),
         f"最多持有 {d['max_days']} 个交易日，到期收盘前卖掉",
         f"股数：整笔（两批合计）打到止损最多亏总资产 {buy_cfg['risk_pct']:g}%，市值不超过总资产 {buy_cfg['max_pos_pct']:g}%；"
         "第一批是一半，并且不超过购买力",
@@ -158,17 +161,19 @@ def _dip_plan(code, quote, rows, acct, held_qty, buy_cfg, pending_codes):
     per_share = limit - stop
     unit, by_risk, by_pos, by_cash, least = _sizes(total, power, per_share, limit, held_qty, buy_cfg)
     full = min(by_risk, by_pos)          # 两批合计的上限
-    first = min(unit(full / 2), by_cash)  # 第一批：一半，且不超过购买力
-    out["checks"] += [(f"两批合计：按风险最多 {by_risk:g} 股、按仓位最多 {by_pos:g} 股 → {full:g} 股", full >= least),
-                      (f"第一批半仓 {unit(full / 2):g} 股，购买力最多 {by_cash:g} 股 → {first:g} 股", first >= least)]
+    half = unit(full / 2) if d["add"] else full
+    first = min(half, by_cash)           # 第一批：一半（不分批就是全部），且不超过购买力
+    out["checks"] += [(f"整笔：按风险最多 {by_risk:g} 股、按仓位最多 {by_pos:g} 股 → {full:g} 股", full >= least),
+                      (f"第一批 {half:g} 股，购买力最多 {by_cash:g} 股 → {first:g} 股", first >= least)]
     if total and first < least:
         out["reasons"].append(f"算出来的第一批不够 {'$' + format(orders.MIN_FRAC_USD, 'g') + ' 的碎股' if buy_cfg.get('fractional', True) else '1 股'}"
                               f"（购买力 ${power:,.2f}）")
         first = 0
-    add_px = round(limit - d["add"] * a, 2)
+    add_px = round(limit - d["add"] * a, 2) if d["add"] else None
+    batches = 2 if d["add"] else 1
     out.update(price=price, limit=limit, stop=stop, target=None, atr=a, qty=first, per_share=per_share,
-               cost=first * limit, max_loss=2 * first * per_share,
-               max_loss_pct=2 * first * per_share / total * 100 if total else None,
+               cost=first * limit, max_loss=batches * first * per_share,
+               max_loss_pct=batches * first * per_share / total * 100 if total else None,
                add_px=add_px, add_qty=first, exit_ma=d["exit_ma"], max_days=d["max_days"], **m)
     out["ok"] = not out["reasons"]
     return out
